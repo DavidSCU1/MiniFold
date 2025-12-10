@@ -38,8 +38,6 @@ MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，
 ```bash
 python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3
 ```
-
-<<<<<<< Updated upstream
 =======
 ### GUI 方式
 
