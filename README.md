@@ -39,6 +39,17 @@ MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，
 python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3
 ```
 
+<<<<<<< Updated upstream
+=======
+### GUI 方式
+
+提供了简洁的桌面界面，便于选择文件并运行流程：
+```bash
+python gui.py
+```
+在界面中选择 FASTA、输出目录，设置 `环境/ssn/阈值`，点击“开始运行”即可。右侧滑杆可调界面缩放（0.9–1.5），提升不同分辨率下的清晰度。
+
+>>>>>>> Stashed changes
 说明：
 - `--env` 为环境描述（例如膜蛋白、嗜热环境等），用于引导候选生成与评估
 - `--ssn` 为候选条数上限
