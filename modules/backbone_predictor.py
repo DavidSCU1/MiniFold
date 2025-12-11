@@ -29,11 +29,35 @@ def ss_to_phi_psi(ss):
 def place_atom(a, b, c, bond_len, bond_angle, dihedral):
     ab = b - a
     bc = c - b
-    n1 = ab / np.linalg.norm(ab)
-    n2 = bc / np.linalg.norm(bc)
-    n = np.cross(n1, n2)
-    n /= np.linalg.norm(n)
-    m = np.cross(n, n2)
+    # Manual cross product for performance and avoiding numpy overhead/errors in optimization
+    # n1 = ab / norm(ab)
+    # n2 = bc / norm(bc)
+    ab_norm = np.linalg.norm(ab)
+    bc_norm = np.linalg.norm(bc)
+    if ab_norm < 1e-9 or bc_norm < 1e-9:
+        return b + np.array([bond_len, 0.0, 0.0])
+    
+    n1 = ab / ab_norm
+    n2 = bc / bc_norm
+    
+    # n = cross(n1, n2)
+    nx = n1[1]*n2[2] - n1[2]*n2[1]
+    ny = n1[2]*n2[0] - n1[0]*n2[2]
+    nz = n1[0]*n2[1] - n1[1]*n2[0]
+    n = np.array([nx, ny, nz])
+    
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-9:
+        n = np.array([0.0, 0.0, 1.0])
+    else:
+        n /= n_norm
+        
+    # m = cross(n, n2)
+    mx = n[1]*n2[2] - n[2]*n2[1]
+    my = n[2]*n2[0] - n[0]*n2[2]
+    mz = n[0]*n2[1] - n[1]*n2[0]
+    m = np.array([mx, my, mz])
+    
     x = bond_len * math.cos(bond_angle)
     y = bond_len * math.sin(bond_angle) * math.cos(dihedral)
     z = bond_len * math.sin(bond_angle) * math.sin(dihedral)
@@ -142,14 +166,22 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=3):
         
         # Optimize
         # Use numerical approximation for gradient (jac=None)
-        res = minimize(_objective, x0, args=(sequence, phi0, psi0), 
-                      method="L-BFGS-B", 
-                      bounds=[(-np.pi, np.pi)] * (2 * n))
-        
-        val = res.fun
-        if best is None or val < best_val:
-            best = res.x
-            best_val = val
+        # Reduced iterations/precision for speed
+        try:
+            res = minimize(_objective, x0, args=(sequence, phi0, psi0), 
+                          method="L-BFGS-B", 
+                          options={'maxiter': 50, 'ftol': 1e-4, 'disp': False},
+                          bounds=[(-np.pi, np.pi)] * (2 * n))
+            
+            val = res.fun
+            if best is None or val < best_val:
+                best = res.x
+                best_val = val
+        except Exception as e:
+            print(f"Optimization warning: {e}")
+            if best is None:
+                best = x0
+                best_val = 1e9
             
     # Rebuild final structure
     phi_final = best[:n]
