@@ -32,24 +32,65 @@ MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，
    $env:DASHSCOPE_API_KEY="..."
    ```
 
-## Usage
+## 使用示例
 
-Prepare a FASTA file (e.g., `test.fasta`) with your protein sequence.
-
-运行示例：
+准备 `test.fasta`（单条或多条序列均可）。运行：
+### 命令行方式
 ```bash
-python minifold.py test.fasta --env "membrane protein" --ssn 5 --threshold 0.5
+python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3
 ```
 
-结果目录结构（以 `test.fasta` 为例）：
-- `output/test/requirements.txt`: 保存环境与筛选阈值等要求参数
-- `output/test/test_ss_candidates.json`: DeepSeek 生成的二级结构候选
-- `output/test/test_2_1.txt`, `test_2_2.txt`, ...: 每条候选单独保存
-- `output/test/test_ss_kept.json`: 千问筛选保留的候选（含概率）
-- `output/test/3d_structures/*.pdb`: 生成的 3D 骨架结构
-- `output/test/3d_structures/*.html`: 交互式可视化页面
-- `output/test/test_report.md`: 汇总报告
-- `output/test/process_report.log`: 流程统计（候选数、保留数、生成模型数）
+### GUI 方式
+
+提供了简洁的桌面界面，便于选择文件并运行流程：
+```bash
+python gui.py
+```
+在界面中选择 FASTA、输出目录，设置 `环境/ssn/阈值`，点击“开始运行”即可。右侧滑杆可调界面缩放（0.9–1.5），提升不同分辨率下的清晰度。
+
+### Web 界面
+
+提供了基于浏览器的现代化界面，支持更丰富的环境配置：
+1. 启动服务：
+   ```bash
+   python web_ui/server.py
+   ```
+   或者直接双击运行 `MiniFold_Web.bat`。
+
+2. 访问界面：
+   打开浏览器访问 `http://localhost:9000`。
+
+3. 环境配置特性：
+   - **全局环境**：可指定运行 MiniFold 主流程的 Python 环境（默认使用启动服务的环境）。
+   - **iGPU 独立环境**：若开启 iGPU 加速，可为该耗时模块指定独立的 Conda 环境（如 `MiniFold_NPU`），实现环境隔离，避免依赖冲突。
+
+说明：
+- `--env` 为环境描述（例如膜蛋白、嗜热环境等），用于引导候选生成与评估
+- `--ssn` 为候选条数上限
+- `--threshold` 为 DeepSeek 评估保留阈值（0–1）
+
+## 输出内容
+以 `test.fasta` 为例，输出目录 `output/test/` 包含：
+- `requirements.txt`：记录运行参数（环境、候选数、阈值）
+- `raw_qwen.txt`：Qwen 的原始候选文本（可能包含超长行，后续会归一到序列长度）
+- `test_ss_candidates.json`：经解析与长度归一的候选（含多链）
+- `case_*/`：每个候选的分链文件与元数据（若评估低于阈值会被清理）
+- `cases_kept.json`：保留候选清单（含概率与文件名）
+- `3d_structures/*.pdb`：Backbone Predictor 生成的骨架 PDB
+- `3d_structures/*.html`：对应的交互式可视化页面
+- `test_report.md`：汇总报告（序列、候选、评估结果、模型链接）
+- `process_report.log`：流程统计（候选数、保留数、生成模型数等）
+
+## 工作流程
+1. 从 FASTA 读取氨基酸序列
+2. 调用 Qwen 生成恰好 `ssn` 条候选（仅 H/E/C；多链用 `|`；总长度严格等于序列长度）
+3. 对候选进行长度归一与多样性检查（至少包含两种字符），并落盘为分链文件
+4. 调用 DeepSeek 对每个候选进行概率评估，按阈值保留高分候选
+5. 对保留候选调用 Backbone Predictor：
+   - H/E/C 分别映射到理想化的 `phi/psi` 扭转角（H:-62/-41；E:-135/135；C 为带噪的环区角）
+   - 使用固定键长/夹角构建 N/CA/C 坐标并导出 PDB
+6. 使用 py3Dmol 生成 HTML，可在浏览器直接查看结构（使用 cdnjs 加载 3Dmol）
+7. 生成报告与统计信息
 
 ## 目录结构
 - `minifold.py`：主流程入口（读取、生成、评估、建模、可视化、报告）

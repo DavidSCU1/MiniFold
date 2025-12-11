@@ -2,6 +2,8 @@ import os
 import threading
 import traceback
 import tkinter as tk
+import subprocess
+import sys
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from modules.env_loader import load_env
@@ -9,6 +11,7 @@ from modules.input_handler import load_fasta
 from modules.qwen_module import qwen_ss_candidates
 from modules.llm_module import analyze_sequence, deepseek_eval_case
 from modules.backbone_predictor import run_backbone_fold_multichain
+from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
 
 
@@ -16,16 +19,16 @@ class MiniFoldGUI:
     def __init__(self, master: tk.Tk):
         self.master = master
         self.master.title("MiniFold GUI")
-        self.master.geometry("840x640")
-        self.master.configure(bg="#f7f9fb")
+        self.master.geometry("1024x768")
+        self.master.configure(bg=self.palette["bg"])
 
         self.palette = {
-            "bg": "#f7f9fb",
-            "fg": "#1f2937",
-            "accent": "#4a6fa5",
-            "accent2": "#7aa5d2",
-            "muted": "#9ca3af",
-            "border": "#e5e7eb",
+            "bg": "#fafbfc",
+            "fg": "#2d3748",
+            "accent": "#4299e1",
+            "accent2": "#63b3ed",
+            "muted": "#718096",
+            "border": "#e2e8f0",
         }
 
         self.scale_var = tk.DoubleVar(value=1.0)
@@ -37,40 +40,52 @@ class MiniFoldGUI:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TLabel", background=self.palette["bg"], foreground=self.palette["fg"], font=("Segoe UI", 10))
-        style.configure("TButton", padding=6, font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", padding=8, font=("Segoe UI", 10))
         style.configure("Accent.TButton", background=self.palette["accent"], foreground="#ffffff")
         style.map(
             "Accent.TButton",
             background=[("active", self.palette["accent2"]), ("disabled", "#cbd5e1")],
             foreground=[("disabled", "#e5e7eb")],
         )
-        style.configure("TEntry", padding=4, relief="flat", fieldbackground="#ffffff")
-        style.configure("TSpinbox", padding=4, relief="flat", fieldbackground="#ffffff")
+        style.configure("TEntry", padding=6, relief="flat", fieldbackground="#ffffff", 
+                        foreground=self.palette["fg"], borderwidth=1)
+        style.configure("TSpinbox", padding=6, relief="flat", fieldbackground="#ffffff",
+                        foreground=self.palette["fg"], borderwidth=1)
         style.configure("Horizontal.TSeparator", background=self.palette["border"])
+        style.configure("Card.TFrame", background=self.palette["bg"])
+        style.configure("Title.TLabel", background=self.palette["bg"], foreground=self.palette["accent"], 
+                        font=("Segoe UI", 16, "bold"))
+        style.configure("Subtitle.TLabel", background=self.palette["bg"], foreground=self.palette["muted"], 
+                        font=("Segoe UI", 9))
 
     def _build_layout(self):
         wrapper = ttk.Frame(self.master, padding=16, style="Card.TFrame")
         wrapper.pack(fill=tk.BOTH, expand=True)
 
+        header = ttk.Frame(wrapper, padding=(0, 0, 0, 8))
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="MiniFold", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text="轻量级蛋白结构分析与建模工作流", style="Subtitle.TLabel").pack(anchor="w")
+
         form = ttk.Frame(wrapper, padding=(8, 8, 8, 12))
         form.pack(fill=tk.X, pady=(0, 8))
 
         # Input file
-        ttk.Label(form, text="FASTA 文件").grid(row=0, column=0, sticky="w")
+        ttk.Label(form, text="📁 FASTA 文件").grid(row=0, column=0, sticky="w")
         self.input_var = tk.StringVar()
         entry_in = ttk.Entry(form, textvariable=self.input_var, width=70)
         entry_in.grid(row=1, column=0, sticky="we", padx=(0, 8))
-        ttk.Button(form, text="浏览", command=self._choose_fasta).grid(row=1, column=1, sticky="e")
+        ttk.Button(form, text="浏览...", command=self._choose_fasta).grid(row=1, column=1, sticky="e")
 
         # Output dir
-        ttk.Label(form, text="输出目录").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(form, text="📂 输出目录").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.out_var = tk.StringVar(value=os.path.join(os.getcwd(), "output"))
         entry_out = ttk.Entry(form, textvariable=self.out_var, width=70)
         entry_out.grid(row=3, column=0, sticky="we", padx=(0, 8))
-        ttk.Button(form, text="浏览", command=self._choose_outdir).grid(row=3, column=1, sticky="e")
+        ttk.Button(form, text="浏览...", command=self._choose_outdir).grid(row=3, column=1, sticky="e")
 
         # Environment
-        ttk.Label(form, text="环境描述 (可选)").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(form, text="⚙️ 环境描述 (可选)").grid(row=4, column=0, sticky="w", pady=(8, 0))
         self.env_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.env_var, width=70).grid(row=5, column=0, sticky="we", padx=(0, 8))
 
@@ -80,17 +95,32 @@ class MiniFoldGUI:
         params.columnconfigure(1, weight=1)
         params.columnconfigure(3, weight=1)
 
-        ttk.Label(params, text="候选数量 (ssn)").grid(row=0, column=0, sticky="w")
+        ttk.Label(params, text="🎯 候选数量 (ssn)").grid(row=0, column=0, sticky="w")
         self.ssn_var = tk.IntVar(value=5)
         ttk.Spinbox(params, from_=1, to=10, textvariable=self.ssn_var, width=6).grid(row=0, column=1, sticky="w", padx=(4, 24))
 
-        ttk.Label(params, text="阈值 (0-1)").grid(row=0, column=2, sticky="w")
+        ttk.Label(params, text="📊 阈值 (0-1)").grid(row=0, column=2, sticky="w")
         self.threshold_var = tk.DoubleVar(value=0.5)
         ttk.Spinbox(params, from_=0.0, to=1.0, increment=0.05, textvariable=self.threshold_var, width=6).grid(row=0, column=3, sticky="w", padx=4)
 
+        # iGPU Acceleration
+        self.igpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(params, text="🚀 启用 iGPU 加速", variable=self.igpu_var).grid(row=0, column=4, sticky="w", padx=12)
+
+        # External Environment (for iGPU)
+        ext_frame = ttk.Frame(form)
+        ext_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(4, 4))
+        
+        self.use_ext_env_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ext_frame, text="使用独立环境 (推荐)", variable=self.use_ext_env_var).pack(side=tk.LEFT)
+        
+        ttk.Label(ext_frame, text="环境名称/路径:").pack(side=tk.LEFT, padx=(8, 4))
+        self.ext_env_name_var = tk.StringVar(value="MiniFold_NPU")
+        ttk.Entry(ext_frame, textvariable=self.ext_env_name_var, width=30).pack(side=tk.LEFT)
+
         # UI scaling for clarity
         scale_frame = ttk.Frame(form)
-        scale_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        scale_frame.grid(row=8, column=0, columnspan=2, sticky="we", pady=(4, 0))
         ttk.Label(scale_frame, text="界面缩放").grid(row=0, column=0, sticky="w")
         self.scale_label = ttk.Label(scale_frame, text="100%")
         self.scale_label.grid(row=0, column=2, sticky="e")
@@ -108,9 +138,11 @@ class MiniFoldGUI:
         # Action buttons
         btns = ttk.Frame(wrapper)
         btns.pack(fill=tk.X, pady=(0, 8))
-        self.run_btn = ttk.Button(btns, text="开始运行", style="Accent.TButton", command=self._on_run)
+        self.run_btn = ttk.Button(btns, text="▶️ 开始运行", style="Accent.TButton", command=self._on_run)
         self.run_btn.pack(side=tk.LEFT)
-        ttk.Button(btns, text="清空日志", command=self._clear_log).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="🗑️ 清空日志", command=self._clear_log).pack(side=tk.LEFT, padx=(8, 0))
+        self.progress = ttk.Progressbar(btns, mode="indeterminate", length=160)
+        self.progress.pack(side=tk.RIGHT)
 
         ttk.Separator(wrapper, orient="horizontal").pack(fill=tk.X, pady=6)
 
@@ -131,6 +163,10 @@ class MiniFoldGUI:
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         self.log("MiniFold GUI 已就绪。请配置参数后点击开始运行。")
+        status_bar = ttk.Frame(wrapper, padding=(0, 8, 0, 0))
+        status_bar.pack(fill=tk.X)
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(status_bar, textvariable=self.status_var).pack(anchor="w")
 
     def _apply_scaling(self):
         """根据 scale_var 调整 Tk scaling 与字体大小，提升清晰度。"""
@@ -186,14 +222,27 @@ class MiniFoldGUI:
     def _set_running(self, running: bool):
         if running:
             self.run_btn.state(["disabled"])
+            try:
+                self.progress.start(12)
+            except Exception:
+                pass
+            self.status_var.set("运行中")
         else:
             self.run_btn.state(["!disabled"])
+            try:
+                self.progress.stop()
+            except Exception:
+                pass
+            self.status_var.set("就绪")
 
     def _on_run(self):
         fasta = self.input_var.get().strip()
         outdir = self.out_var.get().strip()
         ssn = self.ssn_var.get()
         threshold = self.threshold_var.get()
+        use_igpu = self.igpu_var.get()
+        use_ext_env = self.use_ext_env_var.get()
+        ext_env_name = self.ext_env_name_var.get().strip()
 
         if not fasta:
             messagebox.showwarning("提示", "请先选择 FASTA 文件。")
@@ -215,13 +264,13 @@ class MiniFoldGUI:
         self.log("==== 开始运行 MiniFold 工作流 ====")
         t = threading.Thread(
             target=self._run_pipeline,
-            args=(fasta, outdir, self.env_var.get().strip(), ssn, threshold),
+            args=(fasta, outdir, self.env_var.get().strip(), ssn, threshold, use_igpu, use_ext_env, ext_env_name),
             daemon=True,
         )
         t.start()
 
     # Core workflow (adapted from minifold.py)
-    def _run_pipeline(self, fasta, outdir, env_text, ssn, threshold):
+    def _run_pipeline(self, fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name):
         try:
             load_env()
             os.makedirs(outdir, exist_ok=True)
@@ -322,18 +371,70 @@ class MiniFoldGUI:
                         case_idx = meta.get("case")
                         case_dir = os.path.join(workdir, f"case_{case_idx}")
                         chains = []
-                        for fn in meta.get("files", []):
-                            with open(os.path.join(case_dir, fn), "r", encoding="utf-8") as f:
-                                chains.append(f.read().strip())
-                        suffix = f"case{case_idx}_model_{rank}"
-                        pdb_name = f"{prefix}_{suffix}.pdb"
-                        pdb_path = os.path.join(three_d_dir, pdb_name)
-                        self.log(f"  构建骨架: 案例 {case_idx} (p={prob:.2f})")
-                        if run_backbone_fold_multichain(sequence, chains, pdb_path):
-                            html_name = f"{prefix}_{suffix}.html"
-                            html_path = os.path.join(three_d_dir, html_name)
-                            generate_html_view(pdb_path, html_path)
-                            generated_pdbs.append({"pdb": pdb_name, "html": html_name, "chains": len(chains), "case": case_idx, "prob": prob})
+                    for fn in meta.get("files", []):
+                        with open(os.path.join(case_dir, fn), "r", encoding="utf-8") as f:
+                            chains.append(f.read().strip())
+                    suffix = f"case{case_idx}_model_{rank}"
+                    pdb_name = f"{prefix}_{suffix}.pdb"
+                    pdb_path = os.path.join(three_d_dir, pdb_name)
+                    
+                    if use_igpu:
+                        if use_ext_env and ext_env_name:
+                            self.log(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU via external env '{ext_env_name}')...")
+                            import json
+                            igpu_input_data = {"sequence": sequence, "chains": chains}
+                            tmp_input = os.path.join(workdir, f"igpu_input_case{case_idx}.json")
+                            with open(tmp_input, "w", encoding="utf-8") as f:
+                                json.dump(igpu_input_data, f)
+                            
+                            runner_script = os.path.join(os.getcwd(), "modules", "igpu_runner.py")
+                            if os.path.sep in ext_env_name or "/" in ext_env_name:
+                                # Path to python executable
+                                cmd_list = [ext_env_name, runner_script, "--input", tmp_input, "--output", pdb_path]
+                                cmd_str = subprocess.list2cmdline(cmd_list)
+                            else:
+                                # Conda env name
+                                cmd_list = ["conda", "run", "-n", ext_env_name, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
+                                cmd_str = f'conda run -n {ext_env_name} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                            
+                            try:
+                                # Use shell=True for conda on Windows
+                                result = subprocess.run(cmd_str if os.name == "nt" else cmd_list, 
+                                                        capture_output=True, 
+                                                        text=True, 
+                                                        encoding="utf-8", 
+                                                        shell=(os.name=="nt"))
+                                
+                                # Log iGPU Runner output to GUI log for visibility
+                                if result.stdout:
+                                    self.log(f"[iGPU Output] {result.stdout.strip()}")
+                                if result.stderr:
+                                    self.log(f"[iGPU Error] {result.stderr.strip()}")
+                                    
+                                if result.returncode == 0:
+                                    success = True
+                                else:
+                                    success = False
+                                    self.log(f"    iGPU External Failed (RC={result.returncode})")
+                            except Exception as e:
+                                success = False
+                                self.log(f"    Execution Error: {e}")
+                            
+                            if os.path.exists(tmp_input):
+                                try: os.remove(tmp_input) 
+                                except: pass
+                        else:
+                            self.log(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU)...")
+                            success = run_igpu_fold(sequence, chains, pdb_path)
+                    else:
+                        self.log(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (Standard)...")
+                        success = run_backbone_fold_multichain(sequence, chains, pdb_path)
+
+                    if success:
+                        html_name = f"{prefix}_{suffix}.html"
+                        html_path = os.path.join(three_d_dir, html_name)
+                        generate_html_view(pdb_path, html_path)
+                        generated_pdbs.append({"pdb": pdb_name, "html": html_name, "chains": len(chains), "case": case_idx, "prob": prob})
                 else:
                     self.log("无保留案例，使用回退模型。")
                     L = len(sequence)
@@ -342,7 +443,56 @@ class MiniFoldGUI:
                     suffix = "fallback_model"
                     pdb_name = f"{prefix}_{suffix}.pdb"
                     pdb_path = os.path.join(three_d_dir, pdb_name)
-                    if run_backbone_fold_multichain(sequence, [s], pdb_path):
+                    
+                    success = False
+                    if use_igpu:
+                        if use_ext_env and ext_env_name:
+                            self.log(f"  > Fallback: Optimizing backbone (iGPU via external env)...")
+                            import json
+                            igpu_input_data = {"sequence": sequence, "chains": [s]}
+                            tmp_input = os.path.join(workdir, f"igpu_input_fallback.json")
+                            with open(tmp_input, "w", encoding="utf-8") as f:
+                                json.dump(igpu_input_data, f)
+                            
+                            runner_script = os.path.join(os.getcwd(), "modules", "igpu_runner.py")
+                            if os.path.sep in ext_env_name or "/" in ext_env_name:
+                                cmd_list = [ext_env_name, runner_script, "--input", tmp_input, "--output", pdb_path]
+                                cmd_str = subprocess.list2cmdline(cmd_list)
+                            else:
+                                cmd_list = ["conda", "run", "-n", ext_env_name, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
+                                cmd_str = f'conda run -n {ext_env_name} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                            
+                            try:
+                                result = subprocess.run(cmd_str if os.name == "nt" else cmd_list, 
+                                                        capture_output=True, 
+                                                        text=True, 
+                                                        encoding="utf-8", 
+                                                        shell=(os.name=="nt"))
+                                
+                                # Log iGPU Runner output to GUI log for visibility
+                                if result.stdout:
+                                    self.log(f"[iGPU Output] {result.stdout.strip()}")
+                                if result.stderr:
+                                    self.log(f"[iGPU Error] {result.stderr.strip()}")
+
+                                if result.returncode == 0:
+                                    success = True
+                                else:
+                                    success = False
+                                    self.log(f"    iGPU External Failed (RC={result.returncode})")
+                            except Exception as e:
+                                success = False
+                                self.log(f"    Execution Error: {e}")
+                            
+                            if os.path.exists(tmp_input):
+                                try: os.remove(tmp_input) 
+                                except: pass
+                        else:
+                            success = run_igpu_fold(sequence, [s], pdb_path)
+                    else:
+                        success = run_backbone_fold_multichain(sequence, [s], pdb_path)
+
+                    if success:
                         html_name = f"{prefix}_{suffix}.html"
                         html_path = os.path.join(three_d_dir, html_name)
                         generate_html_view(pdb_path, html_path)

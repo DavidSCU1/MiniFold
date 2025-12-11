@@ -4,3 +4,6 @@ biopython
 openai
 numpy
 scipy
+py-cpuinfo
+torch
+torch-directml

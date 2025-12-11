@@ -55,6 +55,10 @@ def place_atom(a, b, c, bond_len, bond_angle, dihedral):
     n1 = ab / ab_norm
     n2 = bc / bc_norm
     
+    # Ensure inputs are numpy arrays for cross product
+    n1 = np.asarray(n1)
+    n2 = np.asarray(n2)
+    
     # Use numpy.cross for efficiency and stability
     n = np.cross(n1, n2)
     n_norm = np.linalg.norm(n)

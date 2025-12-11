@@ -7,6 +7,7 @@ from modules.input_handler import load_fasta
 from modules.llm_module import analyze_sequence, deepseek_eval_case
 from modules.qwen_module import qwen_ss_candidates
 from modules.backbone_predictor import run_backbone_fold_multichain
+from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
 from modules.env_loader import load_env
 
@@ -17,6 +18,8 @@ def main():
     parser.add_argument("--env", default=None, help="Expected protein environment description")
     parser.add_argument("--ssn", type=int, default=5, help="Number of SS candidates from DeepSeek")
     parser.add_argument("--threshold", type=float, default=0.5, help="Likelihood threshold for Qwen filter")
+    parser.add_argument("--igpu", action="store_true", help="Enable iGPU acceleration")
+    parser.add_argument("--igpu-env", default=None, help="Conda environment for iGPU execution")
     
     args = parser.parse_args()
     
@@ -129,8 +132,69 @@ def main():
                 suffix = f"case{case_idx}_model_{rank}"
                 pdb_name = f"{prefix}_{suffix}.pdb"
                 pdb_path = os.path.join(three_d_dir, pdb_name)
-                print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone...")
-                if run_backbone_fold_multichain(sequence, chains, pdb_path):
+                
+                success = False
+                if args.igpu:
+                    if args.igpu_env:
+                        # Use process isolation for iGPU env
+                        print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU via external env '{args.igpu_env}')...")
+                        
+                        # Prepare input for isolated runner
+                        igpu_input_data = {"sequence": sequence, "chains": chains}
+                        tmp_input = os.path.join(workdir, f"igpu_input_case{case_idx}.json")
+                        with open(tmp_input, "w", encoding="utf-8") as f:
+                            json.dump(igpu_input_data, f)
+                        
+                        # Construct runner command
+                        runner_script = os.path.join(os.getcwd(), "modules", "igpu_runner.py")
+                        
+                        # Check if env is a path or name
+                        if os.sep in args.igpu_env or "/" in args.igpu_env:
+                            # Path to python
+                            cmd_list = [args.igpu_env, runner_script, "--input", tmp_input, "--output", pdb_path]
+                            cmd_str = subprocess.list2cmdline(cmd_list)
+                        else:
+                            # Conda env name
+                            if sys.platform == "win32":
+                                cmd_str = f'cmd /c conda run -n {args.igpu_env} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                                cmd_list = cmd_str # For shell=True/False consideration, win usually needs string for cmd /c
+                            else:
+                                cmd_list = ["conda", "run", "-n", args.igpu_env, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
+                                cmd_str = " ".join(cmd_list)
+
+                        try:
+                            # Execute
+                            import subprocess
+                            use_shell = (sys.platform == "win32")
+                            result = subprocess.run(
+                                cmd_str if sys.platform == "win32" else cmd_list,
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                shell=use_shell
+                            )
+                            
+                            if result.stdout: print(f"[iGPU Output] {result.stdout.strip()}")
+                            if result.stderr: print(f"[iGPU Error] {result.stderr.strip()}")
+                            
+                            if result.returncode == 0:
+                                success = True
+                            else:
+                                print(f"    iGPU External Failed (RC={result.returncode})")
+                        except Exception as e:
+                            print(f"    Execution Error: {e}")
+                        
+                        if os.path.exists(tmp_input):
+                            try: os.remove(tmp_input) 
+                            except: pass
+                    else:
+                        print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU)...")
+                        success = run_igpu_fold(sequence, chains, pdb_path)
+                else:
+                    print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (Standard)...")
+                    success = run_backbone_fold_multichain(sequence, chains, pdb_path)
+                
+                if success:
                     html_name = f"{prefix}_{suffix}.html"
                     html_path = os.path.join(three_d_dir, html_name)
                     generate_html_view(pdb_path, html_path)
@@ -149,7 +213,61 @@ def main():
             suffix = "fallback_model"
             pdb_name = f"{prefix}_{suffix}.pdb"
             pdb_path = os.path.join(three_d_dir, pdb_name)
-            if run_backbone_fold_multichain(sequence, [s], pdb_path):
+            
+            success = False
+            if args.igpu:
+                if args.igpu_env:
+                    # Use process isolation for iGPU env
+                    print(f"  > Fallback: Optimizing backbone (iGPU via external env '{args.igpu_env}')...")
+                    
+                    igpu_input_data = {"sequence": sequence, "chains": [s]}
+                    tmp_input = os.path.join(workdir, f"igpu_input_fallback.json")
+                    with open(tmp_input, "w", encoding="utf-8") as f:
+                        json.dump(igpu_input_data, f)
+                    
+                    runner_script = os.path.join(os.getcwd(), "modules", "igpu_runner.py")
+                    
+                    if os.sep in args.igpu_env or "/" in args.igpu_env:
+                        cmd_list = [args.igpu_env, runner_script, "--input", tmp_input, "--output", pdb_path]
+                        cmd_str = subprocess.list2cmdline(cmd_list)
+                    else:
+                        if sys.platform == "win32":
+                            cmd_str = f'cmd /c conda run -n {args.igpu_env} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                            cmd_list = cmd_str
+                        else:
+                            cmd_list = ["conda", "run", "-n", args.igpu_env, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
+                            cmd_str = " ".join(cmd_list)
+
+                    try:
+                        import subprocess
+                        use_shell = (sys.platform == "win32")
+                        result = subprocess.run(
+                            cmd_str if sys.platform == "win32" else cmd_list,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            shell=use_shell
+                        )
+                        
+                        if result.stdout: print(f"[iGPU Output] {result.stdout.strip()}")
+                        if result.stderr: print(f"[iGPU Error] {result.stderr.strip()}")
+                        
+                        if result.returncode == 0:
+                            success = True
+                        else:
+                            print(f"    iGPU External Failed (RC={result.returncode})")
+                    except Exception as e:
+                        print(f"    Execution Error: {e}")
+                    
+                    if os.path.exists(tmp_input):
+                        try: os.remove(tmp_input) 
+                        except: pass
+                else:
+                    success = run_igpu_fold(sequence, [s], pdb_path)
+            else:
+                success = run_backbone_fold_multichain(sequence, [s], pdb_path)
+                
+            if success:
                 html_name = f"{prefix}_{suffix}.html"
                 html_path = os.path.join(three_d_dir, html_name)
                 generate_html_view(pdb_path, html_path)

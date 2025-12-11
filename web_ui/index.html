@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MiniFold Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        
+        /* Custom Scrollbar for Terminal */
+        .terminal-scroll::-webkit-scrollbar { width: 8px; }
+        .terminal-scroll::-webkit-scrollbar-track { background: #1f2937; }
+        .terminal-scroll::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        .terminal-scroll::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 h-screen flex flex-col overflow-hidden">
+
+    <!-- Header -->
+    <header class="bg-white border-b border-gray-200 h-16 flex items-center px-6 justify-between flex-shrink-0 z-10">
+        <div class="flex items-center gap-3">
+            <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">M</div>
+            <h1 class="text-xl font-bold tracking-tight text-gray-900">MiniFold <span class="text-blue-600 font-light">Portal</span></h1>
+        </div>
+        <div class="flex items-center gap-4">
+            <div id="status-indicator" class="flex items-center gap-2 px-3 py-1 rounded-full bg-gray-100 text-gray-500 text-sm font-medium transition-colors">
+                <div class="w-2 h-2 rounded-full bg-gray-400"></div>
+                <span>Ready</span>
+            </div>
+            <a href="https://github.com/DavidSCU1/MiniFold" target="_blank" class="text-gray-400 hover:text-gray-600 transition-colors">
+                <i class="fa-brands fa-github text-xl"></i>
+            </a>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex overflow-hidden">
+        
+        <!-- Left Sidebar: Controls -->
+        <aside class="w-[400px] bg-white border-r border-gray-200 flex flex-col overflow-y-auto flex-shrink-0">
+            <div class="p-6 space-y-6">
+                
+                <!-- Job Section -->
+                <div class="space-y-4">
+                    <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Configuration</h2>
+                    
+                    <div class="space-y-1">
+                        <label class="block text-sm font-medium text-gray-700">Job Name</label>
+                        <input type="text" id="jobName" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm" placeholder="e.g. my_protein_01">
+                    </div>
+
+                    <div class="space-y-1">
+                        <label class="block text-sm font-medium text-gray-700">FASTA Sequence</label>
+                        <div class="space-y-2">
+                            <div class="flex items-center gap-2">
+                                <label class="cursor-pointer px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-md text-xs font-medium transition-colors border border-gray-300">
+                                    <i class="fa-solid fa-upload mr-1"></i> Choose File
+                                    <input type="file" id="fastaFile" accept=".fasta,.fa,.txt" class="hidden">
+                                </label>
+                                <span id="fileNameDisplay" class="text-xs text-gray-400 truncate max-w-[200px]">No file chosen</span>
+                            </div>
+                            <textarea id="fasta" rows="5" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm font-mono text-xs leading-relaxed resize-none" placeholder=">Sequence_1&#10;MKTIIALSYIFCLVFADYK..."></textarea>
+                        </div>
+                    </div>
+                    
+                    <div class="space-y-1">
+                        <label class="block text-sm font-medium text-gray-700">Environment Description (Optional)</label>
+                        <textarea id="envText" rows="2" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm resize-none" placeholder="Describe hardware/software env..."></textarea>
+                    </div>
+                </div>
+
+                <hr class="border-gray-100">
+
+                <!-- Parameters Section -->
+                <div class="space-y-4">
+                    <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Parameters</h2>
+                    
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="space-y-1">
+                            <label class="block text-sm font-medium text-gray-700">Candidates (SSN)</label>
+                            <input type="number" id="ssn" value="5" min="1" max="20" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm">
+                        </div>
+                        <div class="space-y-1">
+                            <label class="block text-sm font-medium text-gray-700">Threshold</label>
+                            <input type="number" id="threshold" value="0.5" step="0.1" min="0" max="1" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm">
+                        </div>
+                    </div>
+
+                    <div class="space-y-3">
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-3">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="useGlobalEnv" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                                <label class="text-sm font-medium text-gray-700">Run in Specific Environment (Global)</label>
+                            </div>
+                            <div id="globalEnvConfig" class="hidden space-y-2">
+                                <input type="text" id="globalEnvName" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="Conda env name (e.g. base) or python path">
+                            </div>
+                        </div>
+
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-3">
+                            <div class="flex items-center justify-between">
+                                <label class="text-sm font-medium text-gray-700">iGPU Acceleration</label>
+                                <input type="checkbox" id="useIgpu" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                            </div>
+                            <div id="igpuEnvConfig" class="hidden space-y-2 border-t border-gray-200 pt-2 mt-2">
+                                <div class="flex items-center gap-2">
+                                    <input type="checkbox" id="useIgpuEnv" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500" checked>
+                                    <label class="text-xs text-gray-600">Use Separate Environment for iGPU</label>
+                                </div>
+                                <div id="igpuEnvInput" class="space-y-1">
+                                    <input type="text" id="igpuEnvName" value="MiniFold_NPU" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="iGPU Conda env name">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="space-y-1">
+                     <label class="block text-sm font-medium text-gray-700">Output Directory</label>
+                     <div class="flex gap-2">
+                         <input type="text" id="outDir" value="output" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm text-gray-700" placeholder="Relative or absolute path...">
+                         <button id="browseOutDirBtn" class="px-3 py-2 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg text-gray-600 transition-colors" title="Browse Folder">
+                            <i class="fa-solid fa-folder-open"></i>
+                         </button>
+                     </div>
+                </div>
+
+            </div>
+            
+            <!-- Footer Action -->
+            <div class="p-6 border-t border-gray-200 bg-gray-50 mt-auto sticky bottom-0">
+                <button id="runBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-4 rounded-xl shadow-lg shadow-blue-200 transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+                    <i class="fa-solid fa-play"></i>
+                    <span>Start Prediction</span>
+                </button>
+            </div>
+        </aside>
+
+        <!-- Right Content: Terminal & Results -->
+        <div class="flex-1 flex flex-col bg-gray-100 min-w-0">
+            
+            <!-- Terminal Section -->
+            <div class="h-1/2 p-6 pb-3 flex flex-col min-h-0">
+                <div class="bg-[#1e1e1e] rounded-xl shadow-sm border border-gray-700 flex-1 flex flex-col overflow-hidden">
+                    <div class="bg-[#2d2d2d] px-4 py-2 flex items-center justify-between border-b border-gray-700 shrink-0">
+                        <div class="flex items-center gap-2">
+                            <i class="fa-solid fa-terminal text-gray-400 text-xs"></i>
+                            <span class="text-gray-300 text-xs font-mono font-medium">Console Output</span>
+                        </div>
+                        <button id="clearLogBtn" class="text-gray-500 hover:text-gray-300 transition-colors text-xs">
+                            <i class="fa-solid fa-trash"></i> Clear
+                        </button>
+                    </div>
+                    <div id="terminal" class="flex-1 p-4 overflow-y-auto font-mono text-xs leading-relaxed text-gray-300 terminal-scroll whitespace-pre-wrap">
+                        <div class="text-gray-500 italic">System ready. Waiting for jobs...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Results Section -->
+            <div class="h-1/2 p-6 pt-3 flex flex-col min-h-0 overflow-hidden">
+                 <div class="flex items-center justify-between mb-4 px-1">
+                    <h2 class="text-lg font-bold text-gray-800 flex items-center gap-2">
+                        <i class="fa-solid fa-folder-open text-blue-500"></i>
+                        Result Library
+                    </h2>
+                    <button id="refreshBtn" class="p-2 text-gray-400 hover:text-blue-600 transition-colors rounded-lg hover:bg-white">
+                        <i class="fa-solid fa-rotate"></i>
+                    </button>
+                 </div>
+                 
+                 <div class="flex-1 overflow-y-auto pr-2 space-y-3" id="historyList">
+                     <!-- Card Template -->
+                     <div class="text-center py-10 text-gray-400">Loading history...</div>
+                 </div>
+            </div>
+
+        </div>
+
+    </main>
+
+    <script>
+        // State
+        const state = {
+            status: 'idle',
+            logs: []
+        };
+
+        // DOM Elements
+        const terminal = document.getElementById('terminal');
+        const statusIndicator = document.getElementById('status-indicator');
+        const runBtn = document.getElementById('runBtn');
+        const historyList = document.getElementById('historyList');
+
+        // File Upload Handler
+        document.getElementById('fastaFile').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            // Update display name
+            document.getElementById('fileNameDisplay').textContent = file.name;
+            document.getElementById('fileNameDisplay').classList.remove('text-gray-400');
+            document.getElementById('fileNameDisplay').classList.add('text-gray-700');
+
+            // Read content
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                document.getElementById('fasta').value = ev.target.result;
+                
+                // Auto-fill job name if empty
+                const jobNameInput = document.getElementById('jobName');
+                if (!jobNameInput.value) {
+                    const name = file.name.replace(/\.[^/.]+$/, "").replace(/\s+/g, '_');
+                    jobNameInput.value = name;
+                }
+            };
+            reader.readAsText(file);
+        });
+
+        // Browse Output Directory Handler
+        document.getElementById('browseOutDirBtn').addEventListener('click', async () => {
+            try {
+                // Request directory picker via API
+                const res = await fetch('/api/browse-dir', { method: 'POST' });
+                const data = await res.json();
+                
+                if (data.path) {
+                    document.getElementById('outDir').value = data.path;
+                } else if (data.error) {
+                    // Fallback or user cancelled
+                    console.log("Browse cancelled or not supported");
+                }
+            } catch (e) {
+                // Fallback for browsers/environments where backend browsing isn't supported
+                // Since this is a local server, we rely on the backend to open the dialog
+                alert("Directory browsing is only available when running locally with GUI support.");
+            }
+        });
+
+        // Toggle Global Env
+        document.getElementById('useGlobalEnv').addEventListener('change', (e) => {
+            const config = document.getElementById('globalEnvConfig');
+            e.target.checked ? config.classList.remove('hidden') : config.classList.add('hidden');
+        });
+
+        // Toggle iGPU Env
+        document.getElementById('useIgpu').addEventListener('change', (e) => {
+            const config = document.getElementById('igpuEnvConfig');
+            e.target.checked ? config.classList.remove('hidden') : config.classList.add('hidden');
+        });
+
+        document.getElementById('useIgpuEnv').addEventListener('change', (e) => {
+            const input = document.getElementById('igpuEnvInput');
+            e.target.checked ? input.classList.remove('hidden') : input.classList.add('hidden');
+        });
+
+        // Run Job
+        runBtn.addEventListener('click', async () => {
+            const data = {
+                jobName: document.getElementById('jobName').value.trim(),
+                fasta: document.getElementById('fasta').value.trim(),
+                envText: document.getElementById('envText').value.trim(),
+                ssn: parseInt(document.getElementById('ssn').value),
+                threshold: parseFloat(document.getElementById('threshold').value),
+                outDir: document.getElementById('outDir').value.trim(),
+                
+                // New logic
+                useGlobalEnv: document.getElementById('useGlobalEnv').checked,
+                globalEnvName: document.getElementById('globalEnvName').value.trim(),
+                
+                useIgpu: document.getElementById('useIgpu').checked,
+                useIgpuEnv: document.getElementById('useIgpuEnv').checked,
+                igpuEnvName: document.getElementById('igpuEnvName').value.trim()
+            };
+
+            if (!data.fasta) {
+                alert("Please enter FASTA sequence.");
+                return;
+            }
+
+            try {
+                setRunningState(true);
+                const res = await fetch('/api/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                
+                if (!res.ok) {
+                    const err = await res.text(); // or res.json() depending on server error format
+                    throw new Error(err || res.statusText);
+                }
+                
+                // Poll for logs immediately
+                pollStatus();
+
+            } catch (e) {
+                alert("Failed to start job: " + e.message);
+                setRunningState(false);
+            }
+        });
+
+        document.getElementById('clearLogBtn').addEventListener('click', () => {
+            terminal.innerHTML = '';
+        });
+        
+        document.getElementById('refreshBtn').addEventListener('click', loadHistory);
+
+        // Polling Status
+        async function pollStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                updateStatusUI(data.status);
+                
+                // Append Logs
+                // In a real app we might want to diff, but here we just replace or append intelligently?
+                // The server sends last 1000 logs. For simplicity, let's just re-render if count changes
+                // Optimization: Keep track of last log timestamp or index
+                
+                // Simple approach: Clear and render all (might flicker but reliable for simple app)
+                // Better approach for this demo:
+                if (data.logs.length > 0) {
+                     const html = data.logs.map(l => {
+                         const color = l.level === 'ERROR' ? 'text-red-400' : (l.level === 'SUCCESS' ? 'text-green-400' : 'text-gray-300');
+                         return `<div class="mb-1"><span class="text-gray-500 select-none">[${l.ts}]</span> <span class="${color}">${escapeHtml(l.text)}</span></div>`
+                     }).join('');
+                     
+                     // Only update if changed to avoid scroll jumping if user scrolled up?
+                     // Actually, always scrolling to bottom is standard for terminals
+                     terminal.innerHTML = html;
+                     terminal.scrollTop = terminal.scrollHeight;
+                }
+
+                if (data.status === 'running') {
+                    setTimeout(pollStatus, 1000);
+                } else {
+                    // Job finished
+                    loadHistory(); // Refresh results
+                }
+
+            } catch (e) {
+                console.error("Poll error", e);
+            }
+        }
+
+        function updateStatusUI(status) {
+            const dot = statusIndicator.querySelector('div');
+            const text = statusIndicator.querySelector('span');
+            
+            statusIndicator.className = "flex items-center gap-2 px-3 py-1 rounded-full text-sm font-medium transition-colors ";
+            
+            if (status === 'running') {
+                statusIndicator.classList.add('bg-blue-100', 'text-blue-600');
+                dot.className = "w-2 h-2 rounded-full bg-blue-500 animate-pulse";
+                text.textContent = "Processing...";
+                setRunningState(true);
+            } else if (status === 'completed') {
+                statusIndicator.classList.add('bg-green-100', 'text-green-600');
+                dot.className = "w-2 h-2 rounded-full bg-green-500";
+                text.textContent = "Completed";
+                setRunningState(false);
+            } else if (status === 'error') {
+                statusIndicator.classList.add('bg-red-100', 'text-red-600');
+                dot.className = "w-2 h-2 rounded-full bg-red-500";
+                text.textContent = "Error";
+                setRunningState(false);
+            } else {
+                statusIndicator.classList.add('bg-gray-100', 'text-gray-500');
+                dot.className = "w-2 h-2 rounded-full bg-gray-400";
+                text.textContent = "Ready";
+                setRunningState(false);
+            }
+        }
+
+        function setRunningState(isRunning) {
+            runBtn.disabled = isRunning;
+            if (isRunning) {
+                runBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                runBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i><span>Running...</span>';
+            } else {
+                runBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                runBtn.innerHTML = '<i class="fa-solid fa-play"></i><span>Start Prediction</span>';
+            }
+        }
+
+        // Load History
+        async function loadHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const data = await res.json();
+                
+                if (data.length === 0) {
+                    historyList.innerHTML = '<div class="text-center py-10 text-gray-400 text-sm">No results found in output directory.</div>';
+                    return;
+                }
+
+                historyList.innerHTML = data.map(item => `
+                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow group">
+                        <div class="flex items-start justify-between mb-3">
+                            <div>
+                                <h3 class="font-bold text-gray-800 text-sm">${escapeHtml(item.name)}</h3>
+                                <p class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock mr-1"></i>${item.time}</p>
+                            </div>
+                            <div class="flex gap-2">
+                                ${item.files.map((f, i) => `
+                                    <a href="/output/${item.name}/3d_structures/${f}" target="_blank" class="px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-lg text-xs font-medium transition-colors flex items-center gap-1">
+                                        <i class="fa-solid fa-cube"></i> Model ${i+1}
+                                    </a>
+                                `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+
+            } catch (e) {
+                historyList.innerHTML = '<div class="text-center py-10 text-red-400 text-sm">Failed to load history.</div>';
+            }
+        }
+
+        function escapeHtml(text) {
+            if (!text) return "";
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Init
+        loadHistory();
+        pollStatus(); // Check if server has pending job status on load
+
+    </script>
+</body>
+</html>
