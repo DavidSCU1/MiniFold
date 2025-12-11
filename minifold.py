@@ -129,7 +129,7 @@ def main():
                 suffix = f"case{case_idx}_model_{rank}"
                 pdb_name = f"{prefix}_{suffix}.pdb"
                 pdb_path = os.path.join(three_d_dir, pdb_name)
-                print(f"  > Case {case_idx} (p={prob:.2f}): Building backbone...")
+                print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone...")
                 if run_backbone_fold_multichain(sequence, chains, pdb_path):
                     html_name = f"{prefix}_{suffix}.html"
                     html_path = os.path.join(three_d_dir, html_name)

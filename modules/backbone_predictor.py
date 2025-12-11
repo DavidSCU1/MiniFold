@@ -2,6 +2,7 @@ import math
 import os
 
 import numpy as np
+from scipy.optimize import minimize
 
 three_letter = {
     "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
@@ -88,26 +89,83 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
         f.write("\n".join(lines))
     return True
 
-def run_backbone_fold_multichain(sequence, chain_ss_list, output_pdb, chain_slices=None):
+def _objective(x, sequence, phi_ref, psi_ref):
+    n = len(sequence)
+    phi = x[:n]
+    psi = x[n:]
+    try:
+        N, CA, C = build_backbone(sequence, phi, psi)
+    except Exception:
+        return 1e9
+    adj = CA[1:] - CA[:-1]
+    adj_len = np.linalg.norm(adj, axis=1)
+    t1 = np.sum((adj_len - 3.80) ** 2)
+    dmat = CA[:, None, :] - CA[None, :, :]
+    dd = np.linalg.norm(dmat, axis=2)
+    mask = (dd < 2.5) & (dd > 0)
+    if np.any(mask):
+        t2 = np.sum((2.5 - dd[mask]) ** 2)
+    else:
+        t2 = 0.0
+    t3 = np.sum((phi - phi_ref) ** 2 + (psi - psi_ref) ** 2)
+    return t1 + 10.0 * t2 + 0.01 * t3
+
+def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=3):
     seq_len = len(sequence)
     if not chain_ss_list:
         return False
     lengths = [len(s) for s in chain_ss_list]
     if sum(lengths) != seq_len:
         return False
-    phi = []
-    psi = []
+        
+    # Generate initial reference angles from SS
+    phi_list = []
+    psi_list = []
     for s in chain_ss_list:
         p, q = ss_to_phi_psi(s)
-        phi.append(p)
-        psi.append(q)
-    phi = np.concatenate(phi)
-    psi = np.concatenate(psi)
-    N, CA, C = build_backbone(sequence, phi, psi)
+        phi_list.append(p)
+        psi_list.append(q)
+    phi0 = np.concatenate(phi_list)
+    psi0 = np.concatenate(psi_list)
+    
+    n = len(sequence)
+    best = None
+    best_val = None
+    
+    # Try multiple initializations
+    for _ in range(iters):
+        # Add random noise to initial guess
+        x0 = np.concatenate([
+            phi0 + np.random.uniform(-0.1, 0.1, n), 
+            psi0 + np.random.uniform(-0.1, 0.1, n)
+        ])
+        
+        # Optimize
+        # Use numerical approximation for gradient (jac=None)
+        res = minimize(_objective, x0, args=(sequence, phi0, psi0), 
+                      method="L-BFGS-B", 
+                      bounds=[(-np.pi, np.pi)] * (2 * n))
+        
+        val = res.fun
+        if best is None or val < best_val:
+            best = res.x
+            best_val = val
+            
+    # Rebuild final structure
+    phi_final = best[:n]
+    psi_final = best[n:]
+    N, CA, C = build_backbone(sequence, phi_final, psi_final)
+    
+    # Calculate chain breaks
     breaks = []
     acc = 0
     for L in lengths[:-1]:
         acc += L
         breaks.append(acc)
+        
     return write_pdb(sequence, N, CA, C, output_pdb, chain_breaks=breaks)
+
+def run_backbone_fold_multichain(sequence, chain_ss_list, output_pdb, chain_slices=None):
+    # Backward compatibility wrapper: now calls optimization
+    return optimize_from_ss(sequence, chain_ss_list, output_pdb)
 
