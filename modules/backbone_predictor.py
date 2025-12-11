@@ -11,6 +11,18 @@ three_letter = {
     "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL"
 }
 
+# Precompute bond parameters
+BOND_PARAMS = {
+    "n_len": 1.329,
+    "ca_len": 1.458,
+    "c_len": 1.525,
+    "ang_C_N_CA": math.radians(121.7),
+    "ang_N_CA_C": math.radians(111.2),
+    "ang_CA_C_N": math.radians(116.2),
+}
+BOND_PARAMS["cos_N_CA_C"] = math.cos(BOND_PARAMS["ang_N_CA_C"])
+BOND_PARAMS["sin_N_CA_C"] = math.sin(BOND_PARAMS["ang_N_CA_C"])
+
 def ss_to_phi_psi(ss):
     phi = []
     psi = []
@@ -29,59 +41,60 @@ def ss_to_phi_psi(ss):
 def place_atom(a, b, c, bond_len, bond_angle, dihedral):
     ab = b - a
     bc = c - b
-    # Manual cross product for performance and avoiding numpy overhead/errors in optimization
-    # n1 = ab / norm(ab)
-    # n2 = bc / norm(bc)
     ab_norm = np.linalg.norm(ab)
     bc_norm = np.linalg.norm(bc)
-    if ab_norm < 1e-9 or bc_norm < 1e-9:
-        return b + np.array([bond_len, 0.0, 0.0])
     
+    # Robust fallback for zero-length vectors
+    if ab_norm < 1e-9:
+        ab = np.array([1.0, 0.0, 0.0])
+        ab_norm = 1.0
+    if bc_norm < 1e-9:
+        bc = np.array([0.0, 1.0, 0.0])
+        bc_norm = 1.0
+        
     n1 = ab / ab_norm
     n2 = bc / bc_norm
     
-    # n = cross(n1, n2)
-    nx = n1[1]*n2[2] - n1[2]*n2[1]
-    ny = n1[2]*n2[0] - n1[0]*n2[2]
-    nz = n1[0]*n2[1] - n1[1]*n2[0]
-    n = np.array([nx, ny, nz])
-    
+    # Use numpy.cross for efficiency and stability
+    n = np.cross(n1, n2)
     n_norm = np.linalg.norm(n)
     if n_norm < 1e-9:
-        n = np.array([0.0, 0.0, 1.0])
+        # Handle collinear vectors: pick orthogonal direction
+        if abs(n1[0]) > abs(n1[1]):
+            n = np.array([-n1[1], n1[0], 0.0])
+        else:
+            n = np.array([0.0, -n1[2], n1[1]])
+        n /= np.linalg.norm(n)
     else:
         n /= n_norm
         
-    # m = cross(n, n2)
-    mx = n[1]*n2[2] - n[2]*n2[1]
-    my = n[2]*n2[0] - n[0]*n2[2]
-    mz = n[0]*n2[1] - n[1]*n2[0]
-    m = np.array([mx, my, mz])
+    m = np.cross(n, n2)
+    # m is already normalized as n and n2 are orthogonal and unit length
     
+    # Use cached trig values if available? (Passed in args?)
+    # For now, keep math calls or pass cached sin/cos if optimize further.
+    # But since bond_angle/dihedral vary, only bond_angle parts could be cached.
     x = bond_len * math.cos(bond_angle)
-    y = bond_len * math.sin(bond_angle) * math.cos(dihedral)
-    z = bond_len * math.sin(bond_angle) * math.sin(dihedral)
+    sin_ba = math.sin(bond_angle)
+    y = bond_len * sin_ba * math.cos(dihedral)
+    z = bond_len * sin_ba * math.sin(dihedral)
+    
     return b + (-n2 * x) + (m * y) + (n * z)
 
 def build_backbone(sequence, phi, psi, omega=None):
-    n_len = 1.329
-    ca_len = 1.458
-    c_len = 1.525
-    ang_C_N_CA = math.radians(121.7)
-    ang_N_CA_C = math.radians(111.2)
-    ang_CA_C_N = math.radians(116.2)
     if omega is None:
         omega = np.full_like(phi, math.pi)
-    N = []
-    CA = []
-    C = []
-    N.append(np.array([0.0, 0.0, 0.0]))
-    CA.append(np.array([ca_len, 0.0, 0.0]))
-    C.append(np.array([ca_len + c_len * math.cos(ang_N_CA_C), c_len * math.sin(ang_N_CA_C), 0.0]))
+    
+    # Use cached parameters
+    p = BOND_PARAMS
+    N = [np.array([0.0, 0.0, 0.0])]
+    CA = [np.array([p["ca_len"], 0.0, 0.0])]
+    C = [np.array([p["ca_len"] + p["c_len"] * p["cos_N_CA_C"], p["c_len"] * p["sin_N_CA_C"], 0.0])]
+    
     for i in range(1, len(sequence)):
-        Ni = place_atom(C[i-1], N[i-1], CA[i-1], n_len, ang_CA_C_N, omega[i-1])
-        CAi = place_atom(Ni, C[i-1], N[i-1], ca_len, ang_C_N_CA, phi[i])
-        Ci = place_atom(CAi, Ni, C[i-1], c_len, ang_N_CA_C, psi[i])
+        Ni = place_atom(C[i-1], N[i-1], CA[i-1], p["n_len"], p["ang_CA_C_N"], omega[i-1])
+        CAi = place_atom(Ni, C[i-1], N[i-1], p["ca_len"], p["ang_C_N_CA"], phi[i])
+        Ci = place_atom(CAi, Ni, C[i-1], p["c_len"], p["ang_N_CA_C"], psi[i])
         N.append(Ni)
         CA.append(CAi)
         C.append(Ci)
@@ -132,9 +145,34 @@ def _objective(x, sequence, phi_ref, psi_ref):
     else:
         t2 = 0.0
     t3 = np.sum((phi - phi_ref) ** 2 + (psi - psi_ref) ** 2)
-    return t1 + 10.0 * t2 + 0.01 * t3
+    # Adjusted weights: reduce collision penalty (t2: 10->5), increase angle penalty (t3: 0.01->0.1)
+    return t1 + 5.0 * t2 + 0.1 * t3
 
-def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=3):
+def _gradient(x, sequence, phi_ref, psi_ref):
+    # Numerical gradient approximation (centered difference) for L-BFGS-B
+    # This is faster than 2-sided approximation inside minimize if we control epsilon
+    eps = 1e-5
+    n = len(x)
+    grad = np.zeros(n)
+    # Baseline
+    f0 = _objective(x, sequence, phi_ref, psi_ref)
+    
+    # We can't easily vectorize _objective due to build_backbone loop
+    # But for 122 dims, this loop is the bottleneck.
+    # To speed up, we only compute grad for phi/psi that actually changed?
+    # No, all coords change if one angle changes.
+    # So we must loop.
+    
+    # NOTE: Since calculating full gradient numerically is expensive (2N calls),
+    # and we don't have analytic gradient yet, we rely on L-BFGS-B's internal approximation.
+    # However, to avoid "hanging", we explicitly use a larger epsilon if we were to implement this.
+    # But actually, providing NO jacobian to minimize() causes it to use 2-point approximation.
+    # The bottleneck is build_backbone speed.
+    # So we skip implementing _gradient here and rely on the speedups in build_backbone
+    # and reduced iterations.
+    return None
+
+def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
     seq_len = len(sequence)
     if not chain_ss_list:
         return False
@@ -158,10 +196,10 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=3):
     
     # Try multiple initializations
     for _ in range(iters):
-        # Add random noise to initial guess
+        # Add random noise to initial guess (increased from 0.1 to 0.3)
         x0 = np.concatenate([
-            phi0 + np.random.uniform(-0.1, 0.1, n), 
-            psi0 + np.random.uniform(-0.1, 0.1, n)
+            phi0 + np.random.uniform(-0.3, 0.3, n), 
+            psi0 + np.random.uniform(-0.3, 0.3, n)
         ])
         
         # Optimize
@@ -170,7 +208,7 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=3):
         try:
             res = minimize(_objective, x0, args=(sequence, phi0, psi0), 
                           method="L-BFGS-B", 
-                          options={'maxiter': 50, 'ftol': 1e-4, 'disp': False},
+                          options={'maxiter': 30, 'ftol': 1e-3, 'disp': False, 'maxls': 20},
                           bounds=[(-np.pi, np.pi)] * (2 * n))
             
             val = res.fun
