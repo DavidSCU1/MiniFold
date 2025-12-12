@@ -24,6 +24,9 @@ class AppState:
         self.status = "idle"  # idle, running, completed, error
         self.logs = []
         self.current_process = None
+        self.progress = 0
+        self.current_step = ""
+        self.start_time = None
         self.lock = threading.Lock()
 
     def add_log(self, message, level="INFO"):
@@ -35,13 +38,25 @@ class AppState:
             if len(self.logs) > 1000:
                 self.logs.pop(0)
 
+    def update_progress(self, percent, step):
+        with self.lock:
+            self.progress = percent
+            self.current_step = step
+
     def clear_logs(self):
         with self.lock:
             self.logs = []
+            self.progress = 0
+            self.current_step = ""
+            self.start_time = None
 
     def set_status(self, status):
         with self.lock:
             self.status = status
+            if status == "running":
+                self.start_time = time.time()
+                self.progress = 0
+                self.current_step = "Starting..."
 
     def set_assembly_status(self, status):
         with self.lock:
@@ -59,10 +74,17 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/status":
+            elapsed = 0
+            if state.status == "running" and state.start_time:
+                elapsed = time.time() - state.start_time
+                
             self.send_json({
                 "status": state.status,
                 "assembly_status": getattr(state, "assembly_status", "idle"),
-                "logs": state.logs
+                "logs": state.logs,
+                "progress": state.progress,
+                "current_step": state.current_step,
+                "elapsed_time": elapsed
             })
         elif parsed.path == "/api/history":
             self.handle_history()
@@ -308,59 +330,65 @@ def run_minifold(data):
         # OR we just rely on `minifold.py` to be the entry point.
         
         # Let's constructing the command:
-        cmd = []
+        # cmd = [] # Moved below
         
-        if use_conda_wrapper and sys.platform == "win32":
-             cmd = ["cmd", "/c", "conda", "run", "-n", conda_env_name, "python", script_path, fasta_path]
-        elif use_conda_wrapper:
-             cmd = ["conda", "run", "-n", conda_env_name, "python", script_path, fasta_path]
-        else:
-             cmd = [python_exec, script_path, fasta_path]
-
-        cmd.extend(["--outdir", data.get("outDir", "output")])
-        if data.get("envText"): cmd.extend(["--env", data.get("envText")])
-        cmd.extend(["--ssn", str(data.get("ssn", 5))])
-        cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
-        
-        if data.get("useIgpu"):
-            cmd.append("--igpu")
-            # If iGPU has specific env, we need to pass it to minifold.py
-            # We need to ensure minifold.py accepts --igpu-env or similar.
-            # Let's assume we pass it via a new flag we will add to minifold.py momentarily.
-            if data.get("useIgpuEnv") and data.get("igpuEnvName"):
-                cmd.extend(["--igpu-env", data.get("igpuEnvName")])
-
-        state.add_log(f"Executing: {' '.join(cmd)}", "INFO")
-
-        # Run Process
-        # Using shell=True for Windows to ensure PATH is searched for 'conda' or 'cmd' correctly
-        use_shell = False # Changed to False to avoid double-shell issues with 'cmd /c'
-        
-        # If we are using "cmd /c ...", shell=True might be redundant or problematic if we pass a list.
-        # On Windows, if shell=True, arguments should be a string, or list is treated differently.
-        # "If args is a sequence, the first item is the command to execute..."
-        # BUT if we manually invoke "cmd", we shouldn't need shell=True necessarily, 
-        # unless we rely on shell features.
-        
-        # The crash "Fatal Python error: init_sys_streams" usually happens when
-        # input/output streams are messed up, often by 'conda run' capturing them weirdly
-        # or when environment activation fails.
-        
-        # Let's try to construct command as a single string if using shell=True
+        # NOTE: We construct the command cleanly here to avoid logic duplication above
         if sys.platform == "win32":
             if use_conda_wrapper:
-                 # "cmd /c conda run -n env python script ..."
+                 # "cmd /c conda run --no-capture-output -n env python -u script ..."
+                 cmd = ["cmd", "/c", "conda", "run", "--no-capture-output", "-n", conda_env_name, "python", "-u", script_path, fasta_path]
+                 
+                 # Append common args
+                 cmd.extend(["--outdir", data.get("outDir", "output")])
+                 if data.get("envText"): cmd.extend(["--env", data.get("envText")])
+                 cmd.extend(["--ssn", str(data.get("ssn", 5))])
+                 cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
+                 
+                 if data.get("useIgpu"):
+                    cmd.append("--igpu")
+                    if data.get("useIgpuEnv") and data.get("igpuEnvName"):
+                        cmd.extend(["--igpu-env", data.get("igpuEnvName")])
+                        
                  # Better to pass as string for shell=True
                  cmd_str = subprocess.list2cmdline(cmd)
-                 use_shell = True # We need shell to resolve 'conda' if not in path, or just to run cmd
+                 use_shell = True
                  cmd_to_run = cmd_str
             else:
                  # Direct python call
+                 cmd = [python_exec, "-u", script_path, fasta_path]
+                 cmd.extend(["--outdir", data.get("outDir", "output")])
+                 if data.get("envText"): cmd.extend(["--env", data.get("envText")])
+                 cmd.extend(["--ssn", str(data.get("ssn", 5))])
+                 cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
+                 
+                 if data.get("useIgpu"):
+                    cmd.append("--igpu")
+                    if data.get("useIgpuEnv") and data.get("igpuEnvName"):
+                        cmd.extend(["--igpu-env", data.get("igpuEnvName")])
+
                  cmd_to_run = cmd
                  use_shell = False
         else:
+             # Linux/Mac
+             if use_conda_wrapper:
+                 cmd = ["conda", "run", "--no-capture-output", "-n", conda_env_name, "python", "-u", script_path, fasta_path]
+             else:
+                 cmd = [python_exec, "-u", script_path, fasta_path]
+             
+             cmd.extend(["--outdir", data.get("outDir", "output")])
+             if data.get("envText"): cmd.extend(["--env", data.get("envText")])
+             cmd.extend(["--ssn", str(data.get("ssn", 5))])
+             cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
+             
+             if data.get("useIgpu"):
+                cmd.append("--igpu")
+                if data.get("useIgpuEnv") and data.get("igpuEnvName"):
+                    cmd.extend(["--igpu-env", data.get("igpuEnvName")])
+
              cmd_to_run = cmd
              use_shell = False
+
+        state.add_log(f"Executing: {cmd_to_run}", "INFO")
 
         process = subprocess.Popen(
             cmd_to_run,
@@ -378,10 +406,24 @@ def run_minifold(data):
         state.current_process = process
         
         # Read output
+        import re
+        progress_pattern = re.compile(r"\[PROGRESS\]\s+(\d+)%\s+-\s+(.*)")
+        
         for line in iter(process.stdout.readline, ''):
             if line:
-                # Filter spam logs if needed
-                state.add_log(line.strip(), "INFO")
+                stripped = line.strip()
+                match = progress_pattern.search(stripped)
+                if match:
+                    percent = int(match.group(1))
+                    step = match.group(2)
+                    state.update_progress(percent, step)
+                    state.add_log(f"Progress: {percent}% - {step}", "INFO")
+                else:
+                    # Filter spam logs if needed
+                    state.add_log(stripped, "INFO")
+                    # Fallback check for debug:
+                    if "[PROGRESS]" in stripped:
+                         state.add_log(f"DEBUG: Found [PROGRESS] but regex failed on: '{stripped}'", "WARNING")
         
         process.wait()
         

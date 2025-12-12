@@ -1,127 +1,112 @@
 # MiniFold
 
-MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，专注于“最小可用预测器”思路：
-- 使用 Qwen 生成若干条符合长度约束的二级结构候选（仅 H/E/C，支持多链，链间用 `|` 分隔）
-- 使用 DeepSeek 评估每个候选的可靠性（返回 0–1 概率并按阈值筛选）
-- 使用自研 Backbone Predictor 将二级结构映射为理想化主链扭转角，重建 N/CA/C 骨架并导出 PDB
-- 使用 py3Dmol 生成交互式 HTML，可在浏览器直接查看结构
+MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，专注于“最小可用预测器”思路。它利用大语言模型（LLM）进行二级结构预测与评估，结合经典的几何算法进行全原子 3D 建模与复合物组装。
 
-该流程完全在本地 Python 环境运行，不依赖 PyRosetta 或 ESMFold 等第三方折叠工具。
+**核心特性：**
+- **LLM 驱动预测**：
+  - 使用 **Qwen** 生成符合长度约束的二级结构候选（H/E/C）。
+  - 使用 **DeepSeek** 评估每个候选的可靠性（概率打分）。
+- **全原子 3D 建模 (Full-Atom)**：
+  - 不仅重建 N-CA-C 骨架，还利用 **NeRF (Natural Extension Reference Frame)** 算法和几何模板自动构建所有侧链原子及骨架氧原子，提供完整的化学细节。
+- **复合物组装 (Complex Assembly)**：
+  - 支持多链预测任务，使用 **L-BFGS-B** 优化算法，基于回转半径（Rg）和链间碰撞（Clash）最小化原则，自动将分散的链组装成紧凑的复合物结构。
+- **现代化交互界面**：
+  - 提供 CLI、GUI 和 Web UI 三种使用方式。
+  - **Web UI** 支持实时进度条显示、任务节点追踪、ETA 预估以及交互式 3D 可视化（Cartoon + Sticks 模式）。
+
+该流程完全在本地 Python 环境运行（LLM 通过 API 调用），不依赖 PyRosetta 或 ESMFold 等庞大的第三方折叠工具。
 
 ## 安装
 
-1. 安装依赖
+1. **克隆项目**
    ```bash
+   git clone https://github.com/DavidSCU1/MiniFold.git
+   cd MiniFold
+   ```
+
+2. **安装依赖**
+   建议使用 Conda 创建独立环境：
+   ```bash
+   conda create -n minifold python=3.9
+   conda activate minifold
    pip install -r requirements.txt
    ```
 
-2. 配置环境变量（推荐 `.env` 文件）
-   在项目根目录创建 `.env` 文件（请勿上传到 GitHub），内容示例：
-   ```
+3. **配置环境变量**
+   在项目根目录创建 `.env` 文件（请勿上传到 GitHub），填写你的 API Key：
+   ```ini
+   # DeepSeek (Volcengine)
    ARK_API_KEY=your_deepseek_api_key_here
    ARK_MODEL=deepseek-v3-2-251201
    ARK_API_URL=https://ark.cn-beijing.volces.com/api/v3/chat/completions
 
+   # Qwen (DashScope)
    DASHSCOPE_API_KEY=your_qwen_api_key_here
    QWEN_MODEL=qwen3-max
    QWEN_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
    ```
-   也可在 PowerShell 临时设置：
-   ```powershell
-   $env:ARK_API_KEY="..."
-   $env:DASHSCOPE_API_KEY="..."
-   ```
 
-## 使用示例
+## 使用指南
 
-准备 `test.fasta`（单条或多条序列均可）。运行：
-### 命令行方式
+### 1. Web 界面 (推荐)
+提供最完整的体验，包括进度追踪和结果管理。
+
+**启动：**
 ```bash
-python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3
+python web_ui/server.py
 ```
+或者直接双击运行 `MiniFold_Web.bat`。
 
-### GUI 方式
+**访问：**
+打开浏览器访问 `http://localhost:9000`。
 
-提供了简洁的桌面界面，便于选择文件并运行流程：
+**功能亮点：**
+- **实时进度监控**：精确显示任务百分比、当前处理步骤（如 "Predicting SS", "Generating 3D Structures"）和预计剩余时间。
+- **环境配置**：支持指定全局运行环境和 iGPU 独立环境（实现环境隔离）。
+- **Product Manager**：浏览历史任务，查看 3D 结构，一键触发复合物组装（Assemble）。
+
+### 2. GUI 桌面版
+简洁的图形界面，适合快速单任务运行。
+
+**启动：**
 ```bash
 python gui.py
 ```
-在界面中选择 FASTA、输出目录，设置 `环境/ssn/阈值`，点击“开始运行”即可。右侧滑杆可调界面缩放（0.9–1.5），提升不同分辨率下的清晰度。
+在界面中选择 FASTA 文件、设置参数并运行。支持界面缩放以适应高分屏。
 
-### Web 界面
+### 3. 命令行 (CLI)
+适合批量处理或服务器环境。
 
-提供了基于浏览器的现代化界面，支持更丰富的环境配置：
-1. 启动服务：
-   ```bash
-   python web_ui/server.py
-   ```
-   或者直接双击运行 `MiniFold_Web.bat`。
+**运行：**
+```bash
+python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3 --outdir output
+```
 
-2. 访问界面：
-   打开浏览器访问 `http://localhost:9000`。
+**参数说明：**
+- `--env`: 蛋白环境描述（如 "membrane protein", "cytosolic"），辅助 LLM 判断。
+- `--ssn`: 生成的二级结构候选数量（默认 5）。
+- `--threshold`: DeepSeek 评估的保留阈值（0-1，默认 0.5）。
+- `--igpu`: 启用 iGPU 加速（如支持）。
+- `--igpu-env`: 指定 iGPU 模块运行的 Conda 环境名称。
 
-3. 环境配置特性：
-   - **全局环境**：可指定运行 MiniFold 主流程的 Python 环境（默认使用启动服务的环境）。
-   - **iGPU 独立环境**：若开启 iGPU 加速，可为该耗时模块指定独立的 Conda 环境（如 `MiniFold_NPU`），实现环境隔离，避免依赖冲突。
+## 输出结果
 
-### 全原子建模与复合物组装
+结果默认保存在 `output/<job_name>/` 目录下：
 
-MiniFold 现已支持更精细的结构生成：
-- **全原子模型 (Full-Atom)**：不仅预测 N-CA-C 骨架，还利用 NeRF 算法和几何模板自动构建所有侧链原子及骨架氧原子，提供完整的化学细节。
-- **复合物组装 (Complex Assembly)**：对于多链预测任务，支持一键将分散的链组装成紧凑的复合物结构。在 Web 界面的“Product Manager”中选择 PDB 文件即可触发。
-- **高级可视化**：内置 3D 浏览器支持 Cartoon + Sticks 混合显示模式，清晰展示骨架走向与侧链细节。
+- **3d_structures/**: 包含生成的 PDB 文件和 HTML 可视化文件。
+  - `*_model_*.pdb`: 全原子 PDB 模型。
+  - `*_model_*.html`: 交互式网页，支持多种显示模式（Cartoon, Sphere, Surface）。
+- **case_*/**: 中间过程文件（分链序列等）。
+- **\*_ss_candidates.json**: 二级结构候选数据。
+- **\*_results.json**: 最终生成的模型清单。
+- **\*_annotation.txt**: LLM 对序列的功能注释。
 
-说明：
-- `--env` 为环境描述（例如膜蛋白、嗜热环境等），用于引导候选生成与评估
-- `--ssn` 为候选条数上限
-- `--threshold` 为 DeepSeek 评估保留阈值（0–1）
+## 技术细节
 
-## 输出内容
-以 `test.fasta` 为例，输出目录 `output/test/` 包含：
-- `requirements.txt`：记录运行参数（环境、候选数、阈值）
-- `raw_qwen.txt`：Qwen 的原始候选文本（可能包含超长行，后续会归一到序列长度）
-- `test_ss_candidates.json`：经解析与长度归一的候选（含多链）
-- `case_*/`：每个候选的分链文件与元数据（若评估低于阈值会被清理）
-- `cases_kept.json`：保留候选清单（含概率与文件名）
-- `3d_structures/*.pdb`：Backbone Predictor 生成的骨架 PDB
-- `3d_structures/*.html`：对应的交互式可视化页面
-- `test_report.md`：汇总报告（序列、候选、评估结果、模型链接）
-- `process_report.log`：流程统计（候选数、保留数、生成模型数等）
+- **侧链构建**：基于几何模板和 NeRF 算法，从主链坐标推导侧链原子位置。目前使用最常见的转子构象（Rotamer）。
+- **刚体组装**：通过 scipy 的 `minimize(method='L-BFGS-B')` 优化旋转和平移矩阵，目标函数结合了回转半径（紧凑性）和原子间距离（避免碰撞）。
+- **进度通信**：核心流程通过标准输出打印 `[PROGRESS]` 标签，Web 服务器实时捕获并推送至前端，解决了传统 CLI 工具在 Web 上进度不可见的问题。
 
-## 工作流程
-1. 从 FASTA 读取氨基酸序列
-2. 调用 Qwen 生成恰好 `ssn` 条候选（仅 H/E/C；多链用 `|`；总长度严格等于序列长度）
-3. 对候选进行长度归一与多样性检查（至少包含两种字符），并落盘为分链文件
-4. 调用 DeepSeek 对每个候选进行概率评估，按阈值保留高分候选
-5. 对保留候选调用 Backbone Predictor：
-   - H/E/C 分别映射到理想化的 `phi/psi` 扭转角（H:-62/-41；E:-135/135；C 为带噪的环区角）
-   - 使用固定键长/夹角构建 N/CA/C 坐标并导出 PDB
-6. 使用 py3Dmol 生成 HTML，可在浏览器直接查看结构（使用 cdnjs 加载 3Dmol）
-7. 生成报告与统计信息
+## 许可证
 
-## 目录结构
-- `minifold.py`：主流程入口（读取、生成、评估、建模、可视化、报告）
-- `modules/input_handler.py`：FASTA 读取
-- `modules/env_loader.py`：加载 `.env` 环境变量
-- `modules/llm_module.py`：DeepSeek 注释与候选评估（返回概率）
-- `modules/qwen_module.py`：Qwen 候选生成与解析（长度归一/多样性过滤）
-- `modules/backbone_predictor.py`：骨架生成（N/CA/C），导出 PDB
-- `modules/visualization.py`：py3Dmol HTML 可视化
-
-## 注意事项
-- `.env` 中包含密钥，请加入 `.gitignore`，切勿提交到仓库
-- 骨架是理想化主链，不包含侧链与 O 原子，适合快速预览与轮廓分析
-- 若网络环境限制，浏览器可能无法加载 3Dmol 的 CDN，可自行替换脚本源地址
-- 当 Qwen 返回纯 H 或长度不符时，内部会进行裁剪/补齐与多样性过滤；严重不合规的候选会被丢弃
-- 若所有候选均被丢弃，流程会生成一个回退模型用于占位与验证
-
-## 依赖
-`requirements.txt`：
-- `requests`
-- `py3Dmol`
-- `biopython`
-- `openai`
-- `numpy`
-
-## 许可协议
-本项目遵循 MIT License。请在使用或分发时保留许可声明。
+MIT License

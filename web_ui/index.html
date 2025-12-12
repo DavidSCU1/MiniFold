@@ -162,6 +162,23 @@
         <!-- Right Content: Terminal & Results -->
         <div class="flex-1 flex flex-col bg-gray-100 min-w-0">
             
+            <!-- Progress Section -->
+            <div id="progressSection" class="px-6 pt-6 pb-0 hidden">
+                <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
+                    <div class="flex justify-between items-center mb-2">
+                        <span id="progressStep" class="text-sm font-semibold text-gray-700">Initializing...</span>
+                        <span id="progressPercent" class="text-sm font-bold text-blue-600">0%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2.5 mb-2">
+                        <div id="progressBar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+                    </div>
+                    <div class="flex justify-between text-xs text-gray-500">
+                        <span>Elapsed: <span id="elapsedTime">00:00</span></span>
+                        <span>Est. Remaining: <span id="remainingTime">--:--</span></span>
+                    </div>
+                </div>
+            </div>
+
             <!-- Terminal Section -->
             <div class="h-1/2 p-6 pb-3 flex flex-col min-h-0">
                 <div class="bg-[#1e1e1e] rounded-xl shadow-sm border border-gray-700 flex-1 flex flex-col overflow-hidden">
@@ -407,6 +424,41 @@
                      terminal.scrollTop = terminal.scrollHeight;
                 }
 
+                // Update Progress Bar
+                const progressSection = document.getElementById('progressSection');
+                if (data.status === 'running') {
+                    progressSection.classList.remove('hidden');
+                    const percent = data.progress || 0;
+                    document.getElementById('progressBar').style.width = `${percent}%`;
+                    document.getElementById('progressPercent').textContent = `${percent}%`;
+                    document.getElementById('progressStep').textContent = data.current_step || "Processing...";
+                    
+                    const elapsed = data.elapsed_time || 0;
+                    document.getElementById('elapsedTime').textContent = formatTime(elapsed);
+                    
+                    // Calculate ETA
+                    if (percent > 0) {
+                        const totalEst = elapsed / (percent / 100);
+                        const remaining = totalEst - elapsed;
+                        document.getElementById('remainingTime').textContent = formatTime(remaining);
+                    } else {
+                         document.getElementById('remainingTime').textContent = "--:--";
+                    }
+                } else {
+                     if (data.status === 'completed' || data.status === 'error') {
+                         // Keep showing for a moment or show final state?
+                         // Maybe hide if idle, but if completed, show 100%
+                         if (data.status === 'completed') {
+                             document.getElementById('progressBar').style.width = '100%';
+                             document.getElementById('progressPercent').textContent = '100%';
+                             document.getElementById('progressStep').textContent = "Completed";
+                             document.getElementById('remainingTime').textContent = "00:00";
+                         }
+                     } else {
+                        progressSection.classList.add('hidden');
+                     }
+                }
+
                 if (data.status === 'running') {
                     setTimeout(pollStatus, 1000);
                 } else if (data.assembly_status === 'running') {
@@ -420,6 +472,13 @@
             } catch (e) {
                 console.error("Poll error", e);
             }
+        }
+
+        function formatTime(seconds) {
+            if (seconds < 0) seconds = 0;
+            const m = Math.floor(seconds / 60);
+            const s = Math.floor(seconds % 60);
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
         }
 
         function updateStatusUI(status) {

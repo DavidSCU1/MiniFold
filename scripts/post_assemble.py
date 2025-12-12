@@ -72,9 +72,14 @@ def process_single_pdb(pdb_path):
         chains = parse_pdb_chains(pdb_path)
         print(f"Parsed {len(chains)} chains from {os.path.basename(pdb_path)}")
         
-        if len(chains) > 1:
-            print(f"Assembling {os.path.basename(pdb_path)} ({len(chains)} chains)...")
-            assembled = assemble_chains(chains)
+        # Even if single chain, we want to run this to generate Sidechains (Full Atom)
+        if len(chains) >= 1:
+            if len(chains) > 1:
+                print(f"Assembling {os.path.basename(pdb_path)} ({len(chains)} chains)...")
+                assembled = assemble_chains(chains)
+            else:
+                print(f"Processing single chain {os.path.basename(pdb_path)} (adding sidechains)...")
+                assembled = chains # No assembly needed, just pass through
             
             # Read sequence from PDB atoms
             full_seq = []
@@ -106,7 +111,7 @@ def process_single_pdb(pdb_path):
             print(f"Generated {html_name}")
             return True
         else:
-            print(f"Skipping {os.path.basename(pdb_path)}, single chain.")
+            print(f"Skipping {os.path.basename(pdb_path)}, no chains found.")
             return False
             
     except Exception as e:

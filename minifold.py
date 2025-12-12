@@ -11,6 +11,10 @@ from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
 from modules.env_loader import load_env
 
+def print_progress(percent, step):
+    print(f"[PROGRESS] {percent}% - {step}")
+    sys.stdout.flush()
+
 def main():
     parser = argparse.ArgumentParser(description="MiniFold: Protein Structure Prediction & Analysis Workflow")
     parser.add_argument("input", help="Path to input FASTA file")
@@ -23,6 +27,7 @@ def main():
     
     args = parser.parse_args()
     
+    print_progress(0, "Initializing workflow...")
     load_env()
     if not os.path.exists(args.outdir):
         os.makedirs(args.outdir)
@@ -30,6 +35,7 @@ def main():
     print(f"Reading input from {args.input}...")
     try:
         sequences = load_fasta(args.input)
+        print_progress(5, "Loaded FASTA sequences")
     except Exception as e:
         print(f"Error loading FASTA: {e}")
         return
@@ -59,11 +65,14 @@ def main():
     with open(req_path, "r", encoding="utf-8") as f:
         req_text = f.read()
     
-    for seq_id, sequence in sequences:
+    total_seqs = len(sequences)
+    for idx, (seq_id, sequence) in enumerate(sequences):
         print(f"\nProcessing sequence: {seq_id}")
+        print_progress(10 + int((idx/total_seqs)*5), f"Processing sequence {seq_id}: Predicting SS (Qwen)")
         safe_id = "".join([c if c.isalnum() else "_" for c in seq_id])
         
         q_result = qwen_ss_candidates(sequence, args.env, num=args.ssn)
+        print_progress(30, "Generated SS candidates")
         cases = q_result.get("cases", [])
         cand_file = os.path.join(workdir, f"{prefix}_ss_candidates.json")
         with open(cand_file, "w", encoding="utf-8") as f:
@@ -72,8 +81,14 @@ def main():
         with open(raw_file, "w", encoding="utf-8") as f:
             f.write(q_result.get("raw", ""))
         
+        print_progress(35, "Verifying candidates (DeepSeek)")
         kept_cases = []
+        total_cases = len(cases)
         for i, case in enumerate(cases):
+            # Update progress within verification
+            p_val = 35 + int((i/total_cases) * 25) # 35% to 60%
+            print_progress(p_val, f"Verifying candidate {i+1}/{total_cases}")
+            
             chains = case.get("chains") or []
             if not chains:
                 continue
@@ -111,6 +126,7 @@ def main():
         with open(kept_file, "w", encoding="utf-8") as f:
             json.dump(kept_cases, f, ensure_ascii=False, indent=2)
         
+        print_progress(60, "Candidates verified. Analyzing sequence...")
         # 3. LLM Annotation
         annotation = analyze_sequence(sequence)
         annotation_file = os.path.join(workdir, f"{prefix}_annotation.txt")
@@ -119,9 +135,16 @@ def main():
         print(f"Annotation saved to {annotation_file}")
             
         print("\nGenerating 3D structures via Backbone Predictor...")
+        print_progress(65, "Generating 3D Structures")
         generated_pdbs = []
         if kept_cases:
-            for rank, meta in enumerate(sorted(kept_cases, key=lambda x: x.get("p", 0.0), reverse=True), start=1):
+            sorted_cases = sorted(kept_cases, key=lambda x: x.get("p", 0.0), reverse=True)
+            total_kept = len(sorted_cases)
+            for rank, meta in enumerate(sorted_cases, start=1):
+                # Update progress for 3D generation (65% -> 95%)
+                p_val = 65 + int(((rank-1)/total_kept) * 30)
+                print_progress(p_val, f"Generating 3D Structure {rank}/{total_kept}")
+                
                 prob = meta.get("p", 0.0)
                 case_idx = meta.get("case")
                 case_dir = os.path.join(workdir, f"case_{case_idx}")
@@ -315,6 +338,17 @@ def main():
             f.write(f"qwen_attempts={q_result.get('attempts', 0)}\n")
             f.write(f"qwen_raw_lines={q_result.get('lines', 0)}\n")
         print("-" * 50)
+
+        # Save manifest
+        manifest_file = os.path.join(workdir, f"{prefix}_results.json")
+        with open(manifest_file, "w", encoding="utf-8") as f:
+            json.dump(generated_pdbs, f, ensure_ascii=False, indent=2)
+            
+        print(f"Workflow completed for {seq_id}. Results saved to {workdir}")
+        print_progress(100, f"Completed processing {seq_id}")
+
+    print("\nAll sequences processed.")
+    print_progress(100, "All tasks completed")
 
 if __name__ == "__main__":
     main()

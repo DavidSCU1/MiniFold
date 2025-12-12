@@ -1,9 +1,11 @@
+numpy
+scipy
 requests
+openai
+python-dotenv
 py3Dmol
 biopython
 openai
-numpy
-scipy
 py-cpuinfo
 torch
 torch-directml
