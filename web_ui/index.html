@@ -16,16 +16,35 @@
         .terminal-scroll::-webkit-scrollbar-track { background: #1f2937; }
         .terminal-scroll::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
         .terminal-scroll::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+
+        /* General Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
     </style>
 </head>
 <body class="bg-gray-50 text-gray-800 h-screen flex flex-col overflow-hidden">
 
     <!-- Header -->
     <header class="bg-white border-b border-gray-200 h-16 flex items-center px-6 justify-between flex-shrink-0 z-10">
-        <div class="flex items-center gap-3">
-            <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">M</div>
-            <h1 class="text-xl font-bold tracking-tight text-gray-900">MiniFold <span class="text-blue-600 font-light">Portal</span></h1>
+        <div class="flex items-center gap-8">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">M</div>
+                <h1 class="text-xl font-bold tracking-tight text-gray-900">MiniFold <span class="text-blue-600 font-light">Portal</span></h1>
+            </div>
+
+            <!-- Navigation Tabs -->
+            <nav class="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                <button id="navJob" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all bg-white text-gray-900 shadow-sm" onclick="switchTab('job')">
+                    <i class="fa-solid fa-flask mr-2"></i>Run Job
+                </button>
+                <button id="navResults" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all text-gray-500 hover:text-gray-900" onclick="switchTab('results')">
+                    <i class="fa-solid fa-folder-tree mr-2"></i>Product Manager
+                </button>
+            </nav>
         </div>
+
         <div class="flex items-center gap-4">
             <div id="status-indicator" class="flex items-center gap-2 px-3 py-1 rounded-full bg-gray-100 text-gray-500 text-sm font-medium transition-colors">
                 <div class="w-2 h-2 rounded-full bg-gray-400"></div>
@@ -37,8 +56,8 @@
         </div>
     </header>
 
-    <!-- Main Content -->
-    <main class="flex-1 flex overflow-hidden">
+    <!-- View: Job Submission -->
+    <main id="viewJob" class="flex-1 flex overflow-hidden">
         
         <!-- Left Sidebar: Controls -->
         <aside class="w-[400px] bg-white border-r border-gray-200 flex flex-col overflow-y-auto flex-shrink-0">
@@ -183,11 +202,58 @@
 
     </main>
 
+    <!-- View: Product Manager -->
+    <main id="viewResults" class="flex-1 flex overflow-hidden hidden">
+        <!-- Left Sidebar: File Tree -->
+        <aside class="w-[300px] bg-white border-r border-gray-200 flex flex-col flex-shrink-0">
+            <div class="p-4 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
+                <h2 class="text-sm font-semibold text-gray-700">Output Explorer</h2>
+                <button onclick="loadFileTree()" class="text-gray-400 hover:text-blue-600 transition-colors">
+                    <i class="fa-solid fa-rotate"></i>
+                </button>
+            </div>
+            <div id="fileTree" class="flex-1 overflow-y-auto p-2 space-y-1 text-sm">
+                <div class="text-center py-10 text-gray-400">Loading files...</div>
+            </div>
+            <!-- Assembly Action -->
+            <div id="assemblyPanel" class="p-4 border-t border-gray-200 bg-gray-50 hidden">
+                <p class="text-xs text-gray-500 mb-2">Selected: <span id="selectedDirName" class="font-medium text-gray-700"></span></p>
+                <button id="assembleBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold py-2 px-3 rounded-lg shadow transition-colors flex items-center justify-center gap-2">
+                    <i class="fa-solid fa-cubes-stacked"></i>
+                    <span>Generate Complex (Assemble)</span>
+                </button>
+            </div>
+        </aside>
+
+        <!-- Right Content: Preview -->
+        <div class="flex-1 flex flex-col bg-gray-50 min-w-0">
+            <div class="h-12 bg-white border-b border-gray-200 flex items-center px-4 justify-between shrink-0">
+                <div class="flex items-center gap-2 text-sm text-gray-600">
+                    <i class="fa-regular fa-file"></i>
+                    <span id="previewFilename" class="font-medium">No file selected</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <a id="downloadBtn" href="#" download class="hidden text-gray-500 hover:text-blue-600 text-sm px-2 py-1 rounded hover:bg-gray-100 transition-colors">
+                        <i class="fa-solid fa-download mr-1"></i> Download
+                    </a>
+                </div>
+            </div>
+            
+            <div id="previewArea" class="flex-1 overflow-hidden relative">
+                <div class="absolute inset-0 flex items-center justify-center text-gray-400 flex-col gap-3">
+                    <i class="fa-solid fa-eye text-4xl opacity-20"></i>
+                    <p>Select a file to preview</p>
+                </div>
+            </div>
+        </div>
+    </main>
+
     <script>
         // State
         const state = {
             status: 'idle',
-            logs: []
+            logs: [],
+            selectedDir: null
         };
 
         // DOM Elements
@@ -316,6 +382,10 @@
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
+                // Update global state for other components to see
+                state.assemblyStatus = data.assembly_status;
+                state.jobStatus = data.status;
+                
                 updateStatusUI(data.status);
                 
                 // Append Logs
@@ -339,9 +409,12 @@
 
                 if (data.status === 'running') {
                     setTimeout(pollStatus, 1000);
+                } else if (data.assembly_status === 'running') {
+                    // Also poll if assembly is running, but don't force switch tab
+                    setTimeout(pollStatus, 1000);
                 } else {
                     // Job finished
-                    loadHistory(); // Refresh results
+                    // loadHistory(); 
                 }
 
             } catch (e) {
@@ -355,17 +428,27 @@
             
             statusIndicator.className = "flex items-center gap-2 px-3 py-1 rounded-full text-sm font-medium transition-colors ";
             
-            if (status === 'running') {
+            let effectiveStatus = status;
+            // If assembly is running, override UI to show processing, even if job is idle
+            if (state.assemblyStatus === 'running') {
+                effectiveStatus = 'running';
+            }
+            
+            if (effectiveStatus === 'running') {
                 statusIndicator.classList.add('bg-blue-100', 'text-blue-600');
                 dot.className = "w-2 h-2 rounded-full bg-blue-500 animate-pulse";
                 text.textContent = "Processing...";
+                // Only disable Run button if actual job is running? 
+                // Or if assembly is running? Maybe allow parallel?
+                // For safety, disable if anything running.
                 setRunningState(true);
-            } else if (status === 'completed') {
+            } else if (effectiveStatus === 'completed') {
+                // ...
                 statusIndicator.classList.add('bg-green-100', 'text-green-600');
                 dot.className = "w-2 h-2 rounded-full bg-green-500";
                 text.textContent = "Completed";
                 setRunningState(false);
-            } else if (status === 'error') {
+            } else if (effectiveStatus === 'error') {
                 statusIndicator.classList.add('bg-red-100', 'text-red-600');
                 dot.className = "w-2 h-2 rounded-full bg-red-500";
                 text.textContent = "Error";
@@ -436,6 +519,272 @@
         // Init
         loadHistory();
         pollStatus(); // Check if server has pending job status on load
+
+        // --- View Switching Logic ---
+        function switchTab(tab) {
+            const navJob = document.getElementById('navJob');
+            const navResults = document.getElementById('navResults');
+            const viewJob = document.getElementById('viewJob');
+            const viewResults = document.getElementById('viewResults');
+
+            if (tab === 'job') {
+                // Update Nav Styles
+                navJob.classList.remove('text-gray-500', 'hover:text-gray-900');
+                navJob.classList.add('bg-white', 'text-gray-900', 'shadow-sm');
+                
+                navResults.classList.add('text-gray-500', 'hover:text-gray-900');
+                navResults.classList.remove('bg-white', 'text-gray-900', 'shadow-sm');
+
+                // Toggle Views
+                viewJob.classList.remove('hidden');
+                viewResults.classList.add('hidden');
+            } else {
+                // Update Nav Styles
+                navResults.classList.remove('text-gray-500', 'hover:text-gray-900');
+                navResults.classList.add('bg-white', 'text-gray-900', 'shadow-sm');
+                
+                navJob.classList.add('text-gray-500', 'hover:text-gray-900');
+                navJob.classList.remove('bg-white', 'text-gray-900', 'shadow-sm');
+
+                // Toggle Views
+                viewResults.classList.remove('hidden');
+                viewJob.classList.add('hidden');
+
+                // Load file tree if empty
+                loadFileTree();
+            }
+        }
+
+        // --- Product Manager Logic ---
+        async function loadFileTree() {
+            const treeContainer = document.getElementById('fileTree');
+            try {
+                const res = await fetch('/api/files');
+                const tree = await res.json();
+                
+                if (tree.length === 0) {
+                    treeContainer.innerHTML = '<div class="text-center py-4 text-gray-400 text-xs">Output directory is empty.</div>';
+                    return;
+                }
+
+                treeContainer.innerHTML = renderTree(tree, 0);
+            } catch (e) {
+                treeContainer.innerHTML = '<div class="text-center py-4 text-red-400 text-xs">Failed to load files.</div>';
+            }
+        }
+
+        function renderTree(nodes, level) {
+            if (!nodes) return '';
+            
+            return nodes.map(node => {
+                const padding = level * 12 + 8;
+                const isDir = node.type === 'dir';
+                
+                if (isDir) {
+                    return `
+                        <div class="select-none">
+                            <div class="flex items-center px-2 py-1.5 hover:bg-gray-100 rounded cursor-pointer text-gray-700" 
+                                 style="padding-left: ${padding}px"
+                                 onclick="toggleFolder(this, '${escapeHtml(node.path)}', '${escapeHtml(node.name)}')">
+                                <i class="fa-solid fa-folder text-yellow-400 mr-2 text-xs"></i>
+                                <span class="truncate font-medium">${escapeHtml(node.name)}</span>
+                                <i class="fa-solid fa-chevron-down ml-auto text-[10px] text-gray-400 transition-transform transform rotate-0"></i>
+                            </div>
+                            <div class="hidden">
+                                ${renderTree(node.children, level + 1)}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    // File
+                    const icon = getFileIcon(node.name);
+                    return `
+                        <div class="flex items-center px-2 py-1.5 hover:bg-blue-50 hover:text-blue-600 rounded cursor-pointer text-gray-600 transition-colors"
+                             style="padding-left: ${padding}px"
+                             onclick="previewFile('${escapeHtml(node.path)}', '${escapeHtml(node.name)}')">
+                            <i class="${icon} mr-2 text-xs opacity-70"></i>
+                            <span class="truncate">${escapeHtml(node.name)}</span>
+                        </div>
+                    `;
+                }
+            }).join('');
+        }
+
+        function toggleFolder(el, path, name) {
+            const childrenContainer = el.nextElementSibling;
+            const arrow = el.querySelector('.fa-chevron-down');
+            
+            // Select folder for assembly
+            state.selectedDir = path;
+            document.getElementById('selectedDirName').textContent = name;
+            
+            // Show assembly panel for folder
+            document.getElementById('assemblyPanel').classList.remove('hidden');
+            document.getElementById('assembleBtn').innerHTML = '<i class="fa-solid fa-cubes-stacked"></i><span>Assemble All in Folder</span>';
+
+            if (childrenContainer.classList.contains('hidden')) {
+                childrenContainer.classList.remove('hidden');
+                arrow.classList.add('rotate-180');
+            } else {
+                childrenContainer.classList.add('hidden');
+                arrow.classList.remove('rotate-180');
+            }
+        }
+
+        // Assembly Button Handler
+        document.getElementById('assembleBtn').addEventListener('click', async () => {
+            if (!state.selectedDir) return;
+            
+            const btn = document.getElementById('assembleBtn');
+            const originalText = btn.innerHTML;
+            
+            try {
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Processing...';
+                
+                const res = await fetch('/api/assemble', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: state.selectedDir })
+                });
+                
+                const data = await res.json();
+                if (data.error) {
+                    alert("Error: " + data.error);
+                } else {
+                    // Do not switch tab. Just notify user via UI state.
+                    // Start polling for files update
+                    pollForFiles();
+                }
+            } catch (e) {
+                alert("Request failed: " + e.message);
+            } finally {
+                // Keep button disabled if processing? 
+                // No, pollStatus/updateStatusUI will handle global "Running" state if we implemented it correctly.
+                // But the button itself should probably re-enable only when done.
+                // However, our global status update logic might be simpler.
+                
+                // Let's rely on the global status indicator to show "Processing..."
+                // But we want to re-enable the button so user can try again if failed, or just reset state.
+                // Actually, if we re-enable immediately, user might click again.
+                // Ideally, we wait until status is completed.
+                
+                // But since we have global polling, let's just reset the button text but maybe keep it disabled if global status is running?
+                // For simplicity, let's re-enable but rely on global status.
+                btn.disabled = false;
+                btn.innerHTML = originalText;
+            }
+        });
+        
+        function pollForFiles() {
+            // Simple poller to refresh file list while assembly is running
+            const interval = setInterval(async () => {
+                // We check global state. If assemblyStatus is back to idle/completed, stop.
+                // But state.assemblyStatus is updated by pollStatus() loop.
+                if (state.assemblyStatus !== 'running') {
+                    clearInterval(interval);
+                    loadFileTree(); // Final refresh
+                } else {
+                    // Refresh file tree to show partial results
+                    loadFileTree();
+                }
+            }, 2000);
+        }
+
+        function getFileIcon(filename) {
+            if (filename.endsWith('.html')) return 'fa-brands fa-html5 text-orange-500';
+            if (filename.endsWith('.pdb')) return 'fa-solid fa-cube text-blue-500';
+            if (filename.endsWith('.json')) return 'fa-solid fa-code text-yellow-500';
+            if (filename.endsWith('.txt') || filename.endsWith('.log')) return 'fa-regular fa-file-lines';
+            if (filename.endsWith('.md')) return 'fa-brands fa-markdown text-blue-400';
+            if (filename.endsWith('.fasta') || filename.endsWith('.fa')) return 'fa-solid fa-dna text-green-500';
+            return 'fa-regular fa-file';
+        }
+
+        function previewFile(path, name) {
+            const previewArea = document.getElementById('previewArea');
+            const previewFilename = document.getElementById('previewFilename');
+            const downloadBtn = document.getElementById('downloadBtn');
+            
+            // Allow assembly if it's a PDB file
+            if (name.endsWith('.pdb') && !name.includes('_complex')) {
+                state.selectedDir = path; // For single file assembly
+                document.getElementById('selectedDirName').textContent = name;
+                document.getElementById('assemblyPanel').classList.remove('hidden');
+                document.getElementById('assembleBtn').innerHTML = '<i class="fa-solid fa-cubes-stacked"></i><span>Assemble This File</span>';
+            } else if (name.endsWith('.pdb') && name.includes('_complex')) {
+                 // Already assembled
+                 document.getElementById('assemblyPanel').classList.add('hidden');
+            } else {
+                 // For other files, hide assembly unless folder is selected (but we can't select folder while clicking file easily unless we track parent)
+                 // Actually, let's keep it simple: if you click a file, you select that file.
+                 // If you want to select the folder, you must click the folder in the tree.
+                 // However, clicking file might have hidden the panel if it's not a PDB.
+                 // Let's decide: Only show panel if folder selected OR .pdb selected.
+                 
+                 // If current selection was a folder, and we clicked a text file, do we hide panel?
+                 // User might want to keep folder selected.
+                 // But state.selectedDir is updated here.
+                 // Let's update state.selectedDir to null if not pdb? 
+                 // No, that breaks "Assemble Folder" flow if user clicks a log file inside.
+                 
+                 // Better UX:
+                 // 1. Click Folder -> Select Folder, Show "Assemble Folder"
+                 // 2. Click PDB -> Select File, Show "Assemble This File"
+                 // 3. Click Other -> Select File, Hide Panel (or revert to Folder?)
+                 
+                 // Let's implement:
+                 if (!name.endsWith('.pdb')) {
+                     document.getElementById('assemblyPanel').classList.add('hidden');
+                     state.selectedDir = null; // Clear selection context for assembly
+                 }
+            }
+            
+            previewFilename.textContent = name;
+            downloadBtn.href = `/output/${path}`;
+            downloadBtn.classList.remove('hidden');
+            
+            const url = `/output/${path}`;
+            
+            if (name.endsWith('.html')) {
+                previewArea.innerHTML = `<iframe src="${url}" class="w-full h-full border-0 bg-white"></iframe>`;
+            } else if (name.endsWith('.pdb')) {
+                 // For PDB, showing text is okay, but maybe user wants 3D? 
+                 // We can use 3Dmol in iframe if we wrap it, but for now let's just show text content 
+                 // or a message that it's a PDB file.
+                 // Actually, we can fetch text and show it.
+                 fetchAndShowText(url);
+            } else if (name.match(/\.(txt|json|md|log|fasta|fa|py|sh|bat)$/i)) {
+                fetchAndShowText(url);
+            } else {
+                previewArea.innerHTML = `
+                    <div class="absolute inset-0 flex items-center justify-center text-gray-400 flex-col gap-3">
+                        <i class="fa-solid fa-file-circle-question text-4xl opacity-20"></i>
+                        <p>Preview not available for this file type.</p>
+                        <a href="${url}" download class="text-blue-600 hover:underline">Download File</a>
+                    </div>
+                `;
+            }
+        }
+
+        async function fetchAndShowText(url) {
+            const previewArea = document.getElementById('previewArea');
+            previewArea.innerHTML = '<div class="p-8 text-gray-400 flex items-center gap-2"><i class="fa-solid fa-circle-notch fa-spin"></i> Loading content...</div>';
+            
+            try {
+                const res = await fetch(url);
+                const text = await res.text();
+                
+                // Simple syntax highlighting or pre wrap
+                previewArea.innerHTML = `
+                    <div class="w-full h-full overflow-auto p-4 bg-white">
+                        <pre class="font-mono text-xs leading-relaxed whitespace-pre-wrap break-words text-gray-800">${escapeHtml(text)}</pre>
+                    </div>
+                `;
+            } catch (e) {
+                previewArea.innerHTML = `<div class="p-8 text-red-400">Failed to load file content: ${e.message}</div>`;
+            }
+        }
 
     </script>
 </body>

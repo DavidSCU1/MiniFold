@@ -24,8 +24,12 @@ def generate_html_view(pdb_file, output_html="structure.html"):
 <body>
     <div id="caption">
         <h2>MiniFold Result</h2>
-        <p>Model: Backbone Predictor</p>
-        <p>Style: Trace (Spectrum Color)</p>
+        <p>Model: Full Atom Model (Backbone + Sidechains)</p>
+        <div style="font-size: 0.9em; margin-top: 5px;">
+            <label><input type="radio" name="style" value="cartoon" checked onchange="setStyle(this.value)"> Cartoon + Sticks</label><br>
+            <label><input type="radio" name="style" value="sphere" onchange="setStyle(this.value)"> Sphere</label><br>
+            <label><input type="radio" name="style" value="surface" onchange="setStyle(this.value)"> Surface</label>
+        </div>
     </div>
     <div id="container" class="mol-container"></div>
     
@@ -33,22 +37,39 @@ def generate_html_view(pdb_file, output_html="structure.html"):
         document.addEventListener('DOMContentLoaded', function() {
             var element = document.getElementById('container');
             var config = { backgroundColor: 'white' };
-            var viewer = $3Dmol.createViewer(element, config);
+            window.viewer = $3Dmol.createViewer(element, config);
             var pdbData = `__PDB__`;
+            
             try {
-                viewer.addModel(pdbData, 'pdb');
-                // Use trace style which is robust for incomplete backbones (missing O atoms)
-                viewer.setStyle({}, {stick: {radius: 0.15}, sphere: {scale: 0.3}}); 
-                // Also add a cartoon-like trace
-                viewer.addStyle({}, {cartoon: {color: 'spectrum', thickness: 0.5, opacity: 0.8}});
-                viewer.zoomTo();
-                viewer.render();
-                viewer.zoom(1.2, 1000);
+                window.viewer.addModel(pdbData, 'pdb');
+                setStyle('cartoon');
+                window.viewer.zoomTo();
+                window.viewer.render();
+                window.viewer.zoom(1.2, 1000);
             } catch (e) {
                 console.error(e);
                 element.innerHTML = '<p style="padding:20px;color:red;">Failed to render PDB: ' + e + '</p>';
             }
         });
+
+        function setStyle(style) {
+            if (!window.viewer) return;
+            window.viewer.removeAllLabels();
+            window.viewer.setStyle({}, {}); // Clear
+            
+            if (style === 'cartoon') {
+                // Cartoon for backbone + Sticks for sidechains
+                window.viewer.addStyle({}, {cartoon: {color: 'spectrum', thickness: 0.4}});
+                // Show sidechains as sticks (excluding backbone atoms usually, but py3Dmol handles overlap well)
+                window.viewer.addStyle({}, {stick: {radius: 0.15, colorscheme: 'Jmol'}});
+            } else if (style === 'sphere') {
+                window.viewer.addStyle({}, {sphere: {scale: 0.3, colorscheme: 'Jmol'}});
+            } else if (style === 'surface') {
+                window.viewer.addStyle({}, {cartoon: {color: 'spectrum'}});
+                window.viewer.addSurface($3Dmol.SurfaceType.VDW, {opacity: 0.7, color: 'white'}, {});
+            }
+            window.viewer.render();
+        }
     </script>
 </body>
 </html>"""

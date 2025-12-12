@@ -104,30 +104,136 @@ def build_backbone(sequence, phi, psi, omega=None):
         C.append(Ci)
     return np.array(N), np.array(CA), np.array(C)
 
+from modules.sidechain_builder import build_sidechain
+
 def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
-    lines = []
-    resn = [three_letter.get(a, "UNK") for a in sequence]
-    serial = 1
-    rid = 1
-    for i in range(len(sequence)):
-        lines.append(
-            f"ATOM  {serial:5d}  N   {resn[i]:>3s} A{rid:4d}    {N[i][0]:8.3f}{N[i][1]:8.3f}{N[i][2]:8.3f}  1.00  0.00           N"
-        )
-        serial += 1
-        lines.append(
-            f"ATOM  {serial:5d}  CA  {resn[i]:>3s} A{rid:4d}    {CA[i][0]:8.3f}{CA[i][1]:8.3f}{CA[i][2]:8.3f}  1.00  0.00           C"
-        )
-        serial += 1
-        lines.append(
-            f"ATOM  {serial:5d}  C   {resn[i]:>3s} A{rid:4d}    {C[i][0]:8.3f}{C[i][1]:8.3f}{C[i][2]:8.3f}  1.00  0.00           C"
-        )
-        serial += 1
-        rid += 1
-        if chain_breaks and (i+1) in chain_breaks:
-            lines.append("TER")
-    lines.append("END")
+    three_letter = {
+        "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+        "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
+        "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+        "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL"
+    }
+    
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        atom_idx = 1
+        res_idx = 1
+        chain_id = "A"
+        chain_idx = 0
+        
+        # Determine chain intervals
+        intervals = []
+        start = 0
+        if chain_breaks:
+            for end in chain_breaks:
+                intervals.append((start, end))
+                start = end
+        intervals.append((start, len(sequence)))
+        
+        current_interval_idx = 0
+        next_break = intervals[0][1]
+        
+        for i, aa in enumerate(sequence):
+            # Check for chain break
+            if i >= next_break:
+                f.write("TER\n")
+                current_interval_idx += 1
+                if current_interval_idx < len(intervals):
+                    next_break = intervals[current_interval_idx][1]
+                chain_idx += 1
+                chain_id = chr(ord('A') + (chain_idx % 26))
+                # Reset res_idx? Usually yes for new chain
+                res_idx = 1
+                
+            resn = three_letter.get(aa, "UNK")
+            
+            # Backbone
+            # N
+            f.write(f"ATOM  {atom_idx:5d}  N   {resn:>3s} {chain_id}{res_idx:4d}    {N[i][0]:8.3f}{N[i][1]:8.3f}{N[i][2]:8.3f}  1.00  0.00           N\n")
+            atom_idx += 1
+            # CA
+            f.write(f"ATOM  {atom_idx:5d}  CA  {resn:>3s} {chain_id}{res_idx:4d}    {CA[i][0]:8.3f}{CA[i][1]:8.3f}{CA[i][2]:8.3f}  1.00  0.00           C\n")
+            atom_idx += 1
+            # C
+            f.write(f"ATOM  {atom_idx:5d}  C   {resn:>3s} {chain_id}{res_idx:4d}    {C[i][0]:8.3f}{C[i][1]:8.3f}{C[i][2]:8.3f}  1.00  0.00           C\n")
+            atom_idx += 1
+            
+            # Sidechain
+            # Only if not GLY
+            if aa != "G":
+                # Build sidechain atoms
+                sc_atoms = build_sidechain(aa, N[i], CA[i], C[i])
+                
+                # Order matters for PDB but visualizing tools are flexible.
+                # Standard order: N, CA, C, O, CB...
+                
+                # We missed Oxygen (O) in backbone!
+                # O is bonded to C.
+                # Standard geometry: C=O bond length 1.23, bisects N-C-CA?
+                # Actually, in planar peptide bond, O is in plane defined by CA(i), C(i), N(i+1).
+                # But we don't have N(i+1) easily here if it's the last residue or chain break.
+                # We can approximate O position: 
+                # Vector C-O is opposite to C-CA roughly? No.
+                # Angle CA-C-O ~ 120.8, N(+1)-C-O ~ 123.
+                # It lies in the plane CA-C-N(+1).
+                # Since psi determines C rotation, and we built C based on psi,
+                # we can place O relative to CA-C frame.
+                
+                # Let's add O first (backbone carbonyl)
+                # Need N, CA, C coordinates.
+                # Use NeRF-like placement or geometric relative to C.
+                # Vector u_c_ca = (CA - C).norm
+                # Vector u_c_n_next?
+                # Without next residue, assume trans planar.
+                # Place O in the plane of CA-C-N(previous) but rotated?
+                # Actually, O is usually placed such that C=O and N-H are anti-parallel in sheets/helices.
+                
+                # Simple approximation:
+                # O is in the plane of N-CA-C? No.
+                # O is in the peptide plane.
+                # We can construct O using CA, C and a virtual atom?
+                
+                # Let's compute O coordinate:
+                # O = place_atom(CA[i], C[i], N[i], 1.23, 120 deg, 180 deg) ? 
+                # This would place it trans to N relative to C-CA bond.
+                try:
+                    O_pos = place_atom(CA[i], C[i], N[i], 1.23, math.radians(120.8), math.pi)
+                    f.write(f"ATOM  {atom_idx:5d}  O   {resn:>3s} {chain_id}{res_idx:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O\n")
+                    atom_idx += 1
+                except:
+                    pass
+
+                # Write Sidechain atoms
+                # Sort keys to maintain some standard order (CB, CG, CD...)
+                # Specific ordering: CB, CG, OD1, ND2...
+                # Simple sort by name length then alphabetical?
+                # PDB order is specific.
+                order = ["CB", "CG", "CG1", "CG2", "OG", "OG1", "SG", 
+                         "CD", "CD1", "CD2", "ND1", "ND2", "OD1", "OD2", "SD",
+                         "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2",
+                         "CZ", "CZ2", "CZ3", "NZ", 
+                         "CH2", "NH1", "NH2", "OH"]
+                         
+                sorted_keys = sorted(sc_atoms.keys(), key=lambda x: order.index(x) if x in order else 99)
+                
+                for atom_name in sorted_keys:
+                    pos = sc_atoms[atom_name]
+                    # Element symbol
+                    element = atom_name[0]
+                    f.write(f"ATOM  {atom_idx:5d}  {atom_name:<4s}{resn:>3s} {chain_id}{res_idx:4d}    {pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}  1.00  0.00           {element}\n")
+                    atom_idx += 1
+            else:
+                # GLY still has O
+                try:
+                    O_pos = place_atom(CA[i], C[i], N[i], 1.23, math.radians(120.8), math.pi)
+                    f.write(f"ATOM  {atom_idx:5d}  O   {resn:>3s} {chain_id}{res_idx:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O\n")
+                    atom_idx += 1
+                except:
+                    pass
+
+            res_idx += 1
+            
+        f.write("TER\n")
+        f.write("END\n")
     return True
 
 def _objective(x, sequence, phi_ref, psi_ref):
@@ -176,23 +282,13 @@ def _gradient(x, sequence, phi_ref, psi_ref):
     # and reduced iterations.
     return None
 
-def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
+def _optimize_single_chain_coords(sequence, ss_str, iters=2):
     seq_len = len(sequence)
-    if not chain_ss_list:
-        return False
-    lengths = [len(s) for s in chain_ss_list]
-    if sum(lengths) != seq_len:
-        return False
+    if not ss_str or len(ss_str) != seq_len:
+        return None
         
     # Generate initial reference angles from SS
-    phi_list = []
-    psi_list = []
-    for s in chain_ss_list:
-        p, q = ss_to_phi_psi(s)
-        phi_list.append(p)
-        psi_list.append(q)
-    phi0 = np.concatenate(phi_list)
-    psi0 = np.concatenate(psi_list)
+    phi0, psi0 = ss_to_phi_psi(ss_str)
     
     n = len(sequence)
     best = None
@@ -200,15 +296,13 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
     
     # Try multiple initializations
     for _ in range(iters):
-        # Add random noise to initial guess (increased from 0.1 to 0.3)
+        # Add random noise to initial guess
         x0 = np.concatenate([
             phi0 + np.random.uniform(-0.3, 0.3, n), 
             psi0 + np.random.uniform(-0.3, 0.3, n)
         ])
         
         # Optimize
-        # Use numerical approximation for gradient (jac=None)
-        # Reduced iterations/precision for speed
         try:
             res = minimize(_objective, x0, args=(sequence, phi0, psi0), 
                           method="L-BFGS-B", 
@@ -220,7 +314,6 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
                 best = res.x
                 best_val = val
         except Exception as e:
-            print(f"Optimization warning: {e}")
             if best is None:
                 best = x0
                 best_val = 1e9
@@ -229,15 +322,52 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
     phi_final = best[:n]
     psi_final = best[n:]
     N, CA, C = build_backbone(sequence, phi_final, psi_final)
+    return N, CA, C
+
+def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
+    seq_len = len(sequence)
+    if not chain_ss_list:
+        return False
+    lengths = [len(s) for s in chain_ss_list]
+    if sum(lengths) != seq_len:
+        return False
     
-    # Calculate chain breaks
+    all_N = []
+    all_CA = []
+    all_C = []
+    
+    start_idx = 0
+    for i, ss in enumerate(chain_ss_list):
+        L = len(ss)
+        sub_seq = sequence[start_idx : start_idx + L]
+        start_idx += L
+        
+        coords = _optimize_single_chain_coords(sub_seq, ss, iters=iters)
+        if coords is None:
+            return False
+            
+        N, CA, C = coords
+        
+        # Offset subsequent chains to avoid visual overlap (simulate separate molecules)
+        # Shift along X axis by 30A * chain_index
+        offset = np.array([30.0 * i, 0.0, 0.0])
+        all_N.append(N + offset)
+        all_CA.append(CA + offset)
+        all_C.append(C + offset)
+    
+    # Concatenate coordinates
+    final_N = np.concatenate(all_N)
+    final_CA = np.concatenate(all_CA)
+    final_C = np.concatenate(all_C)
+        
+    # Calculate chain breaks (cumulative indices)
     breaks = []
     acc = 0
     for L in lengths[:-1]:
         acc += L
         breaks.append(acc)
         
-    return write_pdb(sequence, N, CA, C, output_pdb, chain_breaks=breaks)
+    return write_pdb(sequence, final_N, final_CA, final_C, output_pdb, chain_breaks=breaks)
 
 def run_backbone_fold_multichain(sequence, chain_ss_list, output_pdb, chain_slices=None):
     # Backward compatibility wrapper: now calls optimization

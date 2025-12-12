@@ -10,6 +10,7 @@ import glob
 from urllib.parse import urlparse, parse_qs
 import tkinter as tk
 from tkinter import filedialog
+import importlib.util
 
 # Configuration
 PORT = 9000
@@ -42,7 +43,12 @@ class AppState:
         with self.lock:
             self.status = status
 
+    def set_assembly_status(self, status):
+        with self.lock:
+            self.assembly_status = status
+
 state = AppState()
+state.assembly_status = "idle"
 
 class RequestHandler(http.server.SimpleHTTPRequestHandler):
     def log_request(self, code='-', size='-'):
@@ -55,13 +61,15 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
         if parsed.path == "/api/status":
             self.send_json({
                 "status": state.status,
+                "assembly_status": getattr(state, "assembly_status", "idle"),
                 "logs": state.logs
             })
         elif parsed.path == "/api/history":
             self.handle_history()
+        elif parsed.path == "/api/files":
+            self.handle_file_list()
         elif parsed.path == "/" or parsed.path == "/index.html":
-            self.path = "/index.html"
-            super().do_GET()
+            self.serve_file(os.path.join(ROOT_DIR, "index.html"))
         elif parsed.path.startswith("/output/"):
             # Serve files from the output directory
             # Map /output/... to PROJECT_ROOT/output/...
@@ -100,6 +108,22 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_json({"error": "Cancelled"})
             except Exception as e:
                 self.send_json({"error": str(e)})
+        elif self.path == "/api/assemble":
+            content_len = int(self.headers.get('Content-Length', 0))
+            post_body = self.rfile.read(content_len)
+            data = json.loads(post_body.decode('utf-8'))
+            target_dir = data.get("path")
+            
+            if not target_dir:
+                self.send_error(400, "Missing path")
+                return
+            
+            # Reset assembly status before starting
+            state.set_assembly_status("idle")
+            
+            # Run assembly script in thread
+            threading.Thread(target=run_assembly_task, args=(target_dir,)).start()
+            self.send_json({"message": "Assembly task started"})
         else:
             self.send_error(404)
 
@@ -152,6 +176,55 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                         })
         self.send_json(history)
 
+    def handle_file_list(self):
+        """
+        Recursively list files in output directory for the file explorer.
+        Returns a tree structure:
+        [
+            {
+                "name": "folder1",
+                "type": "dir",
+                "children": [...]
+            },
+            {
+                "name": "file.txt",
+                "type": "file"
+            }
+        ]
+        """
+        def build_tree(path):
+            tree = []
+            try:
+                # Sort: Directories first, then files
+                entries = os.listdir(path)
+                entries.sort(key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
+                
+                for entry in entries:
+                    full_path = os.path.join(path, entry)
+                    rel_path = os.path.relpath(full_path, OUTPUT_DIR).replace("\\", "/")
+                    
+                    item = {
+                        "name": entry,
+                        "path": rel_path
+                    }
+                    
+                    if os.path.isdir(full_path):
+                        item["type"] = "dir"
+                        item["children"] = build_tree(full_path)
+                    else:
+                        item["type"] = "file"
+                        
+                    tree.append(item)
+            except Exception as e:
+                print(f"Error listing dir {path}: {e}")
+            return tree
+
+        if os.path.exists(OUTPUT_DIR):
+            tree = build_tree(OUTPUT_DIR)
+        else:
+            tree = []
+        self.send_json(tree)
+
     def serve_file(self, path):
         try:
             with open(path, 'rb') as f:
@@ -160,6 +233,14 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                 if path.endswith(".html"):
                     ctype = "text/html"
                 elif path.endswith(".pdb"):
+                    ctype = "text/plain"
+                elif path.endswith(".js"):
+                    ctype = "application/javascript"
+                elif path.endswith(".css"):
+                    ctype = "text/css"
+                elif path.endswith(".json"):
+                    ctype = "application/json"
+                elif path.endswith(".txt"):
                     ctype = "text/plain"
                 else:
                     ctype = "application/octet-stream"
@@ -253,8 +334,92 @@ def run_minifold(data):
 
         # Run Process
         # Using shell=True for Windows to ensure PATH is searched for 'conda' or 'cmd' correctly
-        use_shell = (sys.platform == "win32")
+        use_shell = False # Changed to False to avoid double-shell issues with 'cmd /c'
         
+        # If we are using "cmd /c ...", shell=True might be redundant or problematic if we pass a list.
+        # On Windows, if shell=True, arguments should be a string, or list is treated differently.
+        # "If args is a sequence, the first item is the command to execute..."
+        # BUT if we manually invoke "cmd", we shouldn't need shell=True necessarily, 
+        # unless we rely on shell features.
+        
+        # The crash "Fatal Python error: init_sys_streams" usually happens when
+        # input/output streams are messed up, often by 'conda run' capturing them weirdly
+        # or when environment activation fails.
+        
+        # Let's try to construct command as a single string if using shell=True
+        if sys.platform == "win32":
+            if use_conda_wrapper:
+                 # "cmd /c conda run -n env python script ..."
+                 # Better to pass as string for shell=True
+                 cmd_str = subprocess.list2cmdline(cmd)
+                 use_shell = True # We need shell to resolve 'conda' if not in path, or just to run cmd
+                 cmd_to_run = cmd_str
+            else:
+                 # Direct python call
+                 cmd_to_run = cmd
+                 use_shell = False
+        else:
+             cmd_to_run = cmd
+             use_shell = False
+
+        process = subprocess.Popen(
+            cmd_to_run,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=PROJECT_ROOT,
+            universal_newlines=True,
+            shell=use_shell,
+            # Ensure we don't inherit handles that might conflict
+            close_fds=(sys.platform != "win32") 
+        )
+        
+        state.current_process = process
+        
+        # Read output
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                # Filter spam logs if needed
+                state.add_log(line.strip(), "INFO")
+        
+        process.wait()
+        
+        if process.returncode == 0:
+            state.set_status("completed")
+            state.add_log("Job completed successfully.", "SUCCESS")
+        else:
+            state.set_status("error")
+            state.add_log(f"Job failed with exit code {process.returncode}", "ERROR")
+
+    except Exception as e:
+        state.set_status("error")
+        state.add_log(f"Server Error: {str(e)}", "ERROR")
+        import traceback
+        state.add_log(traceback.format_exc(), "ERROR")
+        
+def run_assembly_task(rel_path):
+    # rel_path comes from handle_file_list, which generates paths relative to OUTPUT_DIR.
+    # e.g. "sblky/3d_structures/model.pdb"
+    
+    # We must construct full path using OUTPUT_DIR, NOT PROJECT_ROOT directly.
+    # Because rel_path does not contain "output/".
+    
+    full_path = os.path.abspath(os.path.join(OUTPUT_DIR, rel_path))
+    
+    # Security check: ensure inside OUTPUT_DIR (which is inside PROJECT_ROOT)
+    if not full_path.startswith(OUTPUT_DIR):
+        state.add_log(f"Access denied: {rel_path}", "ERROR")
+        return
+
+    state.set_assembly_status("running")
+    state.add_log(f"Starting post-assembly for {full_path}...", "INFO")
+    
+    script_path = os.path.join(PROJECT_ROOT, "scripts", "post_assemble.py")
+    
+    cmd = [sys.executable, script_path, "--dir", full_path]
+    
+    try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -262,35 +427,35 @@ def run_minifold(data):
             text=True,
             bufsize=1,
             cwd=PROJECT_ROOT,
-            universal_newlines=True,
-            shell=use_shell
+            universal_newlines=True
         )
         
-        state.current_process = process
-
-        for line in process.stdout:
-            state.add_log(line.strip(), "INFO")
-        
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                state.add_log(f"[Assembly] {line.strip()}", "INFO")
+                
         process.wait()
-        
         if process.returncode == 0:
-            state.set_status("completed")
-            state.add_log("Task finished successfully!", "SUCCESS")
+            state.add_log("Assembly task finished.", "SUCCESS")
+            state.set_assembly_status("completed")
         else:
-            state.set_status("error")
-            state.add_log(f"Task failed with exit code {process.returncode}", "ERROR")
-
+            state.add_log("Assembly task failed.", "ERROR")
+            state.set_assembly_status("error")
+            
     except Exception as e:
-        state.set_status("error")
-        state.add_log(f"Internal Error: {str(e)}", "ERROR")
+        state.add_log(f"Assembly launch failed: {e}", "ERROR")
+        state.set_assembly_status("error")
 
 if __name__ == "__main__":
-    # Ensure web_ui is current dir so index.html is found
-    os.chdir(ROOT_DIR)
-    
-    server = http.server.ThreadingHTTPServer(("", PORT), RequestHandler)
+    # Ensure output dir exists
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+        
+    server = http.server.HTTPServer(('0.0.0.0', PORT), RequestHandler)
     print(f"Server started at http://localhost:{PORT}")
+    
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("Server stopped")
+        print("\nShutting down server...")
+        server.server_close()
