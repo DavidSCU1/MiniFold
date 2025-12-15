@@ -31,6 +31,10 @@ MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，
    conda activate minifold
    pip install -r requirements.txt
    ```
+**iGPU 加速（DirectML）提示：**
+- Windows 上建议安装 `torch-directml` 以启用 Intel/AMD/NVIDIA 等设备的通用加速。
+- 默认 `requirements.txt` 同时包含 `torch` 与 `torch-directml`，如遇到冲突，可在独立 Conda 环境中安装并在 Web UI 的 iGPU 设置里填写该环境名称。
+- 运行时在 Web UI 勾选 “iGPU Acceleration” 或 CLI 使用 `--igpu` 即可启用；如需隔离依赖，可再配合 `--igpu-env <env_name>`。
 
 3. **配置环境变量**
    在项目根目录创建 `.env` 文件（请勿上传到 GitHub），填写你的 API Key：
@@ -63,7 +67,7 @@ python web_ui/server.py
 **功能亮点：**
 - **实时进度监控**：精确显示任务百分比、当前处理步骤（如 "Predicting SS", "Generating 3D Structures"）和预计剩余时间。
 - **环境配置**：支持指定全局运行环境和 iGPU 独立环境（实现环境隔离）。
-- **Product Manager**：浏览历史任务，查看 3D 结构，一键触发复合物组装（Assemble）。
+- **Product Manager**：浏览历史任务与 3D 结构。模型在预测阶段自动完成复合体装配与侧链补全（Refined），无需额外 Assemble 操作。
 
 ### 2. GUI 桌面版
 简洁的图形界面，适合快速单任务运行。
@@ -94,8 +98,9 @@ python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3 
 结果默认保存在 `output/<job_name>/` 目录下：
 
 - **3d_structures/**: 包含生成的 PDB 文件和 HTML 可视化文件。
-  - `*_model_*.pdb`: 全原子 PDB 模型。
-  - `*_model_*.html`: 交互式网页，支持多种显示模式（Cartoon, Sphere, Surface）。
+  - `*_model_*.pdb`: 主链与基本侧链模型（作为中间产物保留）。
+  - `*_refined.pdb`: 精修复合体（自动装配并补全侧链），作为最终 PDB 输出。
+  - `*_model_*.html`: 交互式网页，默认使用精修版 PDB 展示（Cartoon, Sphere, Surface）。
 - **case_*/**: 中间过程文件（分链序列等）。
 - **\*_ss_candidates.json**: 二级结构候选数据。
 - **\*_results.json**: 最终生成的模型清单。

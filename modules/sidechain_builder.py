@@ -19,32 +19,101 @@ SC_BONDS = {
     'SD': {'len': 1.81, 'angle': math.radians(110.0)}, # C-S type
 }
 
-# Chi angles (rotamers) - simplified defaults
-# Format: {AA: [chi1, chi2, chi3, chi4]}
-# In a real predictor, these would come from the model.
-# Here we use most common rotamer values.
-ROTAMERS = {
-    'ALA': [],
-    'ARG': [180, 180, 180, 180],
-    'ASN': [-60, -60],
-    'ASP': [-60, -60],
-    'CYS': [-60],
-    'GLN': [-60, -60, 180],
-    'GLU': [-60, -60, 180],
-    'GLY': [],
-    'HIS': [-60, 180],
-    'ILE': [-60, 180],
-    'LEU': [-60, 180],
-    'LYS': [-60, 180, 180, 180],
-    'MET': [-60, 180, 180],
-    'PHE': [-60, 90],
-    'PRO': [0, 0], # Special case ring
-    'SER': [-60],
-    'THR': [-60],
-    'TRP': [-60, 90],
-    'TYR': [-60, 90],
-    'VAL': [180]
+# Advanced Rotamer Library (Approximation of Dunbrack 2010 top probabilities)
+# Format: {AA: [[chi1, chi2, ...], [chi1, chi2, ...], ...]}
+ROTAMER_LIBRARY = {
+    'ALA': [[]],
+    'ARG': [[180, 180, 180, 180], [-60, 180, 180, 180], [-60, -60, 180, 180], [180, 60, 180, 180], [-60, 180, -60, 180]],
+    'ASN': [[-60, -60], [-60, 90], [180, -60], [-60, 0]],
+    'ASP': [[-60, -60], [-180, -60], [-60, 90], [180, 90]],
+    'CYS': [[-60], [180], [60]],
+    'GLN': [[-60, -60, 0], [-180, 60, 0], [-60, 180, 0], [-60, 60, 0]],
+    'GLU': [[-60, -60, 0], [-180, 60, 0], [-60, 180, 0], [-60, 60, 0]],
+    'GLY': [[]],
+    'HIS': [[-60, 180], [-60, -60], [180, 60], [60, -60]],
+    'ILE': [[-60, 180], [-60, -60], [180, 60]],
+    'LEU': [[-60, 180], [180, 60], [-60, 60]],
+    'LYS': [[-60, 180, 180, 180], [-60, -60, 180, 180], [180, 180, 180, 180]],
+    'MET': [[-60, 180, 180], [-60, 180, 60], [-60, -60, 180]],
+    'PHE': [[-60, 90], [180, 90], [-60, 0]],
+    'PRO': [[0, 0], [10, 0]], 
+    'SER': [[-60], [60], [180]],
+    'THR': [[-60], [60], [180]],
+    'TRP': [[-60, 90], [180, 90], [-60, 0]],
+    'TYR': [[-60, 90], [180, 90], [-60, 0]],
+    'VAL': [[180], [-60], [60]]
 }
+
+# Compatibility alias for single-rotamer usage
+ROTAMERS = {k: v[0] for k, v in ROTAMER_LIBRARY.items()}
+
+def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=None):
+    """
+    Selects the best rotamer from the library by checking for clashes.
+    Currently checks self-consistency and simple steric clash if env provided.
+    If no env, returns the most probable (first) rotamer.
+    """
+    three_letter = {
+        "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+        "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
+        "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+        "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL"
+    }
+    res_name = three_letter.get(aa_code, "ALA")
+    options = ROTAMER_LIBRARY.get(res_name, [[]])
+    
+    if (local_environment_atoms is None
+        or (isinstance(local_environment_atoms, np.ndarray) and local_environment_atoms.size == 0)
+        or len(options) == 1):
+        return build_sidechain(aa_code, n_coord, ca_coord, c_coord, options[0])
+        
+    best_atoms = None
+    min_clash = 1e9
+    
+    # Iterate through rotamers
+    for rot in options:
+        atoms = build_sidechain(aa_code, n_coord, ca_coord, c_coord, rot)
+        clash_score = 0.0
+        
+        # Check clashes against environment
+        if local_environment_atoms is not None and len(local_environment_atoms) > 0:
+            sc_coords = np.array(list(atoms.values()))
+            if len(sc_coords) == 0: 
+                if min_clash > 0: # Empty sidechain (GLY) is always best
+                     min_clash = 0
+                     best_atoms = atoms
+                continue
+
+            # Ensure env is numpy array
+            env = local_environment_atoms
+            if not isinstance(env, np.ndarray):
+                env = np.array(env)
+            
+            # Simple distance check (N_sc, M_env)
+            # Use broadcasting
+            # shape: (N, 1, 3) - (1, M, 3) -> (N, M, 3)
+            # This can be memory intensive for large env.
+            # Optimization: Compute dists in blocks or just loop if M is huge.
+            # For typical proteins (M < 5000), it's fine.
+            
+            diff = sc_coords[:, np.newaxis, :] - env[np.newaxis, :, :]
+            dists = np.linalg.norm(diff, axis=2)
+            
+            # Count clashes (dist < 1.5 Angstrom)
+            # Ignore self (dist < 0.1)
+            clashes = np.sum((dists < 1.5) & (dists > 0.1))
+            clash_score = clashes
+            
+        if clash_score < min_clash:
+            min_clash = clash_score
+            best_atoms = atoms
+            
+        # If perfect score, break early (greedy)
+        if min_clash == 0:
+            break
+            
+    if best_atoms is not None:
+        return best_atoms
 
 def place_atom_nerf(a, b, c, bond_len, bond_angle, torsion):
     """

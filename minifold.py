@@ -10,6 +10,7 @@ from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
 from modules.env_loader import load_env
+from modules.assembler import parse_pdb_chains, assemble_chains, write_complex_pdb
 
 def print_progress(percent, step):
     print(f"[PROGRESS] {percent}% - {step}")
@@ -218,6 +219,34 @@ def main():
                     success = run_backbone_fold_multichain(sequence, chains, pdb_path)
                 
                 if success:
+                    # Refinement Step (Automatic Assembly & Sidechain Packing)
+                    print(f"  > Refinement: Optimizing sidechains and assembly for {pdb_name}...")
+                    try:
+                        chains_data = parse_pdb_chains(pdb_path)
+                        if chains_data:
+                            # 1. Assembly (Docking) if needed
+                            if len(chains_data) > 1:
+                                assembled_chains = assemble_chains(chains_data)
+                            else:
+                                assembled_chains = chains_data
+                            
+                            # 2. Sidechain Packing (Full Atom Refinement)
+                            # Update path to reflect refined status
+                            refined_pdb_name = f"{prefix}_{suffix}_refined.pdb"
+                            refined_pdb_path = os.path.join(three_d_dir, refined_pdb_name)
+                            
+                            if write_complex_pdb(assembled_chains, sequence, refined_pdb_path):
+                                print(f"  > Refinement complete. Saved to {refined_pdb_name}")
+                                # Use refined model for final output
+                                pdb_path = refined_pdb_path
+                                pdb_name = refined_pdb_name
+                            else:
+                                print("  > Refinement failed to write. Using raw backbone.")
+                        else:
+                            print("  > Refinement skipped (no chains parsed).")
+                    except Exception as e:
+                        print(f"  > Refinement error: {e}")
+
                     html_name = f"{prefix}_{suffix}.html"
                     html_path = os.path.join(three_d_dir, html_name)
                     generate_html_view(pdb_path, html_path)
@@ -235,6 +264,10 @@ def main():
             s = (pattern * ((L // len(pattern)) + 1))[:L]
             suffix = "fallback_model"
             pdb_name = f"{prefix}_{suffix}.pdb"
+            # Fallback model often uses default pattern SS, which can be refined.
+            # But here suffix is "fallback_model".
+            # The logic below uses suffix for refined name: "{prefix}_{suffix}_refined.pdb"
+            # Wait, pdb_name definition seems correct.
             pdb_path = os.path.join(three_d_dir, pdb_name)
             
             success = False
@@ -291,6 +324,32 @@ def main():
                 success = run_backbone_fold_multichain(sequence, [s], pdb_path)
                 
             if success:
+                # Refinement Step (Automatic Assembly & Sidechain Packing)
+                # For fallback model, it might be single chain, but still useful to refine sidechains.
+                print(f"  > Refinement: Optimizing sidechains and assembly for {pdb_name}...")
+                try:
+                    chains_data = parse_pdb_chains(pdb_path)
+                    if chains_data:
+                        if len(chains_data) > 1:
+                            assembled_chains = assemble_chains(chains_data)
+                        else:
+                            assembled_chains = chains_data
+                        
+                        refined_pdb_name = f"{prefix}_{suffix}_refined.pdb"
+                        refined_pdb_path = os.path.join(three_d_dir, refined_pdb_name)
+                        
+                        if write_complex_pdb(assembled_chains, sequence, refined_pdb_path):
+                            print(f"  > Refinement complete. Saved to {refined_pdb_name}")
+                            # Update pdb_path and pdb_name to point to the refined model
+                            pdb_path = refined_pdb_path
+                            pdb_name = refined_pdb_name
+                        else:
+                            print("  > Refinement failed to write. Using raw backbone.")
+                    else:
+                        print("  > Refinement skipped (no chains parsed).")
+                except Exception as e:
+                    print(f"  > Refinement error: {e}")
+
                 html_name = f"{prefix}_{suffix}.html"
                 html_path = os.path.join(three_d_dir, html_name)
                 generate_html_view(pdb_path, html_path)

@@ -5,7 +5,6 @@ openai
 python-dotenv
 py3Dmol
 biopython
-openai
 py-cpuinfo
 torch
 torch-directml

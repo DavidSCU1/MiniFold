@@ -11,14 +11,14 @@ three_letter = {
     "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL"
 }
 
-# Precompute bond parameters
+# Refined Bond Parameters (Engh & Huber, 1991)
 BOND_PARAMS = {
-    "n_len": 1.329,
-    "ca_len": 1.458,
-    "c_len": 1.525,
+    "n_len": 1.33,
+    "ca_len": 1.46,
+    "c_len": 1.52,
     "ang_C_N_CA": math.radians(121.7),
-    "ang_N_CA_C": math.radians(111.2),
-    "ang_CA_C_N": math.radians(116.2),
+    "ang_N_CA_C": math.radians(111.0), # Tetrahedral sp3 is 109.5, but backbone is slightly strained
+    "ang_CA_C_N": math.radians(116.2), # Planar sp2 at C is 120, but N-C-O > 120 usually
 }
 BOND_PARAMS["cos_N_CA_C"] = math.cos(BOND_PARAMS["ang_N_CA_C"])
 BOND_PARAMS["sin_N_CA_C"] = math.sin(BOND_PARAMS["ang_N_CA_C"])
@@ -28,80 +28,127 @@ def ss_to_phi_psi(ss):
     psi = []
     for c in ss:
         if c == "H":
-            phi.append(-62.0)
-            psi.append(-41.0)
+            # Ideal Alpha Helix
+            phi.append(-math.radians(57.0))
+            psi.append(-math.radians(47.0))
         elif c == "E":
-            phi.append(-135.0)
-            psi.append(135.0)
+            # Ideal Beta Sheet (Parallel/Anti-parallel avg)
+            phi.append(-math.radians(119.0))
+            psi.append(math.radians(113.0))
         else:
-            phi.append(-60.0 + np.random.uniform(-15.0, 15.0))
-            psi.append(140.0 + np.random.uniform(-15.0, 15.0))
-    return np.deg2rad(np.array(phi)), np.deg2rad(np.array(psi))
+            # Coil / Loop (Ramachandran favored)
+            # Typically -60 to -90 phi, +120 to +160 psi for Polyproline II like
+            # Randomize slightly to avoid flat sticks
+            phi.append(math.radians(-60.0 + np.random.uniform(-10, 10)))
+            psi.append(math.radians(140.0 + np.random.uniform(-10, 10)))
+    return np.array(phi), np.array(psi)
 
-def place_atom(a, b, c, bond_len, bond_angle, dihedral):
-    ab = b - a
+def place_atom(a, b, c, bond_len, bond_angle, torsion):
+    """
+    NeRF: Places atom D such that:
+    Distance C-D = bond_len
+    Angle B-C-D = bond_angle
+    Dihedral A-B-C-D = torsion
+    """
     bc = c - b
-    ab_norm = np.linalg.norm(ab)
-    bc_norm = np.linalg.norm(bc)
+    ab = b - a
     
-    # Robust fallback for zero-length vectors
-    if ab_norm < 1e-9:
-        ab = np.array([1.0, 0.0, 0.0])
-        ab_norm = 1.0
-    if bc_norm < 1e-9:
-        bc = np.array([0.0, 1.0, 0.0])
-        bc_norm = 1.0
-        
-    n1 = ab / ab_norm
-    n2 = bc / bc_norm
+    # Normalize
+    bc_l = np.linalg.norm(bc)
+    ab_l = np.linalg.norm(ab)
     
-    # Ensure inputs are numpy arrays for cross product
-    n1 = np.asarray(n1)
-    n2 = np.asarray(n2)
+    if bc_l < 1e-6 or ab_l < 1e-6:
+        # Fallback for degenerate cases (start of chain)
+        return c + np.array([bond_len, 0, 0])
+
+    bc_u = bc / bc_l
     
-    # Use numpy.cross for efficiency and stability
-    n = np.cross(n1, n2)
-    n_norm = np.linalg.norm(n)
-    if n_norm < 1e-9:
-        # Handle collinear vectors: pick orthogonal direction
-        if abs(n1[0]) > abs(n1[1]):
-            n = np.array([-n1[1], n1[0], 0.0])
-        else:
-            n = np.array([0.0, -n1[2], n1[1]])
-        n /= np.linalg.norm(n)
+    # Normal to plane ABC
+    n = np.cross(ab, bc_u)
+    n_l = np.linalg.norm(n)
+    if n_l < 1e-6:
+        # Collinear case: arbitrary normal
+        n = np.array([1.0, 0.0, 0.0]) if abs(bc_u[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     else:
-        n /= n_norm
+        n = n / n_l
         
-    m = np.cross(n, n2)
-    # m is already normalized as n and n2 are orthogonal and unit length
+    # Binormal vector (in plane ABC, perp to BC)
+    nb = np.cross(n, bc_u)
     
-    # Use cached trig values if available? (Passed in args?)
-    # For now, keep math calls or pass cached sin/cos if optimize further.
-    # But since bond_angle/dihedral vary, only bond_angle parts could be cached.
-    x = bond_len * math.cos(bond_angle)
-    sin_ba = math.sin(bond_angle)
-    y = bond_len * sin_ba * math.cos(dihedral)
-    z = bond_len * sin_ba * math.sin(dihedral)
+    # D relative to C in local frame (bc, nb, n)
+    # x component along extension of BC (which is -bc_u if bond angle 180)
+    # Standard NeRF derivation:
+    # D = C + R * D_local
+    # D_local = [ -len * cos(angle), len * sin(angle) * cos(torsion), len * sin(angle) * sin(torsion) ]
+    # But basis vectors: 
+    # v1 = bc_u
+    # v2 = nb (in plane)
+    # v3 = n (perp)
     
-    return b + (-n2 * x) + (m * y) + (n * z)
+    # Careful with angle definition. bond_angle is B-C-D.
+    # If B-C-D is 180, D is along BC extension.
+    # Formula usually assumes exterior angle or interior.
+    # Let's use standard NeRF formula:
+    # D = C + len * ( -bc_u * cos(angle) + nb * sin(angle) * cos(torsion) + n * sin(angle) * sin(torsion) )
+    # This assumes torsion=0 is cis (planar with A-B-C)?
+    # Standard: torsion is angle between plane ABC and BCD.
+    
+    x = -bond_len * math.cos(bond_angle)
+    y = bond_len * math.sin(bond_angle) * math.cos(torsion)
+    z = bond_len * math.sin(bond_angle) * math.sin(torsion)
+    
+    d = c + (bc_u * x) + (nb * y) + (n * z)
+    return d
 
 def build_backbone(sequence, phi, psi, omega=None):
     if omega is None:
-        omega = np.full_like(phi, math.pi)
+        omega = np.full(len(phi), math.pi) # Trans peptide bond
     
-    # Use cached parameters
+    # Initial atoms: N at origin, CA on x-axis, C in xy-plane
     p = BOND_PARAMS
-    N = [np.array([0.0, 0.0, 0.0])]
-    CA = [np.array([p["ca_len"], 0.0, 0.0])]
-    C = [np.array([p["ca_len"] + p["c_len"] * p["cos_N_CA_C"], p["c_len"] * p["sin_N_CA_C"], 0.0])]
+    
+    # Initialize list of coordinates
+    # N(0)
+    n0 = np.array([0.0, 0.0, 0.0])
+    
+    # CA(0): dist(N-CA), arbitrary angle
+    ca0 = np.array([p["ca_len"], 0.0, 0.0])
+    
+    # C(0): dist(CA-C), angle(N-CA-C)
+    # torsion? Arbitrary, put in xy plane.
+    # Use place_atom with virtual previous atom (-1,0,0)
+    c0 = place_atom(np.array([-1.0, 0.0, 0.0]), n0, ca0, p["c_len"], p["ang_N_CA_C"], 0.0)
+    
+    N = [n0]
+    CA = [ca0]
+    C = [c0]
     
     for i in range(1, len(sequence)):
-        Ni = place_atom(C[i-1], N[i-1], CA[i-1], p["n_len"], p["ang_CA_C_N"], omega[i-1])
-        CAi = place_atom(Ni, C[i-1], N[i-1], p["ca_len"], p["ang_C_N_CA"], phi[i])
-        Ci = place_atom(CAi, Ni, C[i-1], p["c_len"], p["ang_N_CA_C"], psi[i])
-        N.append(Ni)
-        CA.append(CAi)
-        C.append(Ci)
+        # 1. Place N(i)
+        # Bond: C(i-1)-N(i)
+        # Angle: CA(i-1)-C(i-1)-N(i)
+        # Torsion: N(i-1)-CA(i-1)-C(i-1)-N(i) = psi(i-1)
+        prev_psi = psi[i-1]
+        ni = place_atom(N[i-1], CA[i-1], C[i-1], p["n_len"], p["ang_CA_C_N"], prev_psi)
+        
+        # 2. Place CA(i)
+        # Bond: N(i)-CA(i)
+        # Angle: C(i-1)-N(i)-CA(i)
+        # Torsion: CA(i-1)-C(i-1)-N(i)-CA(i) = omega(i-1) (peptide bond, ~180)
+        prev_omega = omega[i-1]
+        cai = place_atom(CA[i-1], C[i-1], ni, p["ca_len"], p["ang_C_N_CA"], prev_omega)
+        
+        # 3. Place C(i)
+        # Bond: CA(i)-C(i)
+        # Angle: N(i)-CA(i)-C(i)
+        # Torsion: C(i-1)-N(i)-CA(i)-C(i) = phi(i)
+        curr_phi = phi[i]
+        ci = place_atom(C[i-1], ni, cai, p["c_len"], p["ang_N_CA_C"], curr_phi)
+        
+        N.append(ni)
+        CA.append(cai)
+        C.append(ci)
+        
     return np.array(N), np.array(CA), np.array(C)
 
 from modules.sidechain_builder import build_sidechain
@@ -161,7 +208,8 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
             # Only if not GLY
             if aa != "G":
                 # Build sidechain atoms
-                sc_atoms = build_sidechain(aa, N[i], CA[i], C[i])
+                from modules.sidechain_builder import pack_sidechain
+                sc_atoms = pack_sidechain(aa, N[i], CA[i], C[i])
                 
                 # Order matters for PDB but visualizing tools are flexible.
                 # Standard order: N, CA, C, O, CB...
@@ -236,131 +284,180 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
         f.write("END\n")
     return True
 
-def _objective(x, sequence, phi_ref, psi_ref):
-    n = len(sequence)
-    phi = x[:n]
-    psi = x[n:]
-    try:
-        N, CA, C = build_backbone(sequence, phi, psi)
-    except Exception:
-        return 1e9
-    adj = CA[1:] - CA[:-1]
-    adj_len = np.linalg.norm(adj, axis=1)
-    t1 = np.sum((adj_len - 3.80) ** 2)
-    dmat = CA[:, None, :] - CA[None, :, :]
-    dd = np.linalg.norm(dmat, axis=2)
-    mask = (dd < 2.5) & (dd > 0)
-    if np.any(mask):
-        t2 = np.sum((2.5 - dd[mask]) ** 2)
-    else:
-        t2 = 0.0
-    t3 = np.sum((phi - phi_ref) ** 2 + (psi - psi_ref) ** 2)
-    # Adjusted weights: reduce collision penalty (t2: 10->5), increase angle penalty (t3: 0.01->0.1)
-    return t1 + 5.0 * t2 + 0.1 * t3
+def _rotation_matrix(rx, ry, rz):
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    return Rz @ Ry @ Rx
 
-def _gradient(x, sequence, phi_ref, psi_ref):
-    # Numerical gradient approximation (centered difference) for L-BFGS-B
-    # This is faster than 2-sided approximation inside minimize if we control epsilon
-    eps = 1e-5
-    n = len(x)
-    grad = np.zeros(n)
-    # Baseline
-    f0 = _objective(x, sequence, phi_ref, psi_ref)
-    
-    # We can't easily vectorize _objective due to build_backbone loop
-    # But for 122 dims, this loop is the bottleneck.
-    # To speed up, we only compute grad for phi/psi that actually changed?
-    # No, all coords change if one angle changes.
-    # So we must loop.
-    
-    # NOTE: Since calculating full gradient numerically is expensive (2N calls),
-    # and we don't have analytic gradient yet, we rely on L-BFGS-B's internal approximation.
-    # However, to avoid "hanging", we explicitly use a larger epsilon if we were to implement this.
-    # But actually, providing NO jacobian to minimize() causes it to use 2-point approximation.
-    # The bottleneck is build_backbone speed.
-    # So we skip implementing _gradient here and rely on the speedups in build_backbone
-    # and reduced iterations.
-    return None
+def _apply_transform(coords, trans, rot_angles):
+    R = _rotation_matrix(*rot_angles)
+    return (coords @ R.T) + trans
 
-def _optimize_single_chain_coords(sequence, ss_str, iters=2):
-    seq_len = len(sequence)
-    if not ss_str or len(ss_str) != seq_len:
-        return None
-        
-    # Generate initial reference angles from SS
-    phi0, psi0 = ss_to_phi_psi(ss_str)
+def _objective_joint(x, chain_data, total_residues):
+    phi_all = x[:total_residues]
+    psi_all = x[total_residues : 2*total_residues]
+    rb_params = x[2*total_residues:]
     
-    n = len(sequence)
-    best = None
-    best_val = None
+    all_CA = []
+    idx = 0
+    rb_idx = 0
+    t_ang = 0.0
     
-    # Try multiple initializations
-    for _ in range(iters):
-        # Add random noise to initial guess
-        x0 = np.concatenate([
-            phi0 + np.random.uniform(-0.3, 0.3, n), 
-            psi0 + np.random.uniform(-0.3, 0.3, n)
-        ])
+    for i, (seq, ss, phi_ref, psi_ref) in enumerate(chain_data):
+        n = len(seq)
+        phi = phi_all[idx : idx+n]
+        psi = psi_all[idx : idx+n]
+        idx += n
         
-        # Optimize
+        # Weighted angle constraint
+        # SS 'C' -> weight 0.1, others 1.0
+        # Can be precomputed, but here SS is string.
+        weights = np.array([0.1 if c == 'C' else 1.0 for c in ss])
+        
+        d_phi = (phi - phi_ref + np.pi) % (2 * np.pi) - np.pi
+        d_psi = (psi - psi_ref + np.pi) % (2 * np.pi) - np.pi
+        t_ang += np.sum(weights * (d_phi**2 + d_psi**2))
+        
         try:
-            res = minimize(_objective, x0, args=(sequence, phi0, psi0), 
-                          method="L-BFGS-B", 
-                          options={'maxiter': 30, 'ftol': 1e-3, 'disp': False, 'maxls': 20},
-                          bounds=[(-np.pi, np.pi)] * (2 * n))
+            N_c, CA_c, C_c = build_backbone(seq, phi, psi)
+        except:
+            return 1e9
             
-            val = res.fun
-            if best is None or val < best_val:
-                best = res.x
-                best_val = val
-        except Exception as e:
-            if best is None:
-                best = x0
-                best_val = 1e9
+        if i > 0:
+            params = rb_params[rb_idx : rb_idx+6]
+            rb_idx += 6
+            trans = params[:3]
+            rot = params[3:]
+            N_c = _apply_transform(N_c, trans, rot)
+            CA_c = _apply_transform(CA_c, trans, rot)
+            C_c = _apply_transform(C_c, trans, rot)
             
-    # Rebuild final structure
-    phi_final = best[:n]
-    psi_final = best[n:]
-    N, CA, C = build_backbone(sequence, phi_final, psi_final)
-    return N, CA, C
+        all_CA.append(CA_c)
+        
+    full_CA = np.concatenate(all_CA)
+    centroid = np.mean(full_CA, axis=0)
+    rg2 = np.sum(np.sum((full_CA - centroid)**2, axis=1)) / len(full_CA)
+    
+    dmat = full_CA[:, None, :] - full_CA[None, :, :]
+    dd = np.linalg.norm(dmat, axis=2)
+    mask = np.triu(np.ones(dd.shape, dtype=bool), k=2)
+    dists = dd[mask]
+    
+    clash_mask = dists < 3.5
+    if np.any(clash_mask):
+        t_clash = np.sum((3.5 - dists[clash_mask]) ** 2)
+    else:
+        t_clash = 0.0
+        
+    # Increased Rg weight (0.1 -> 0.5) to fix "stick" structures for Coil-heavy proteins
+    return 0.5 * rg2 + 10.0 * t_clash + 5.0 * t_ang
 
 def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
-    seq_len = len(sequence)
-    if not chain_ss_list:
-        return False
+    if not chain_ss_list: return False
     lengths = [len(s) for s in chain_ss_list]
-    if sum(lengths) != seq_len:
-        return False
+    if sum(lengths) != len(sequence): return False
     
-    all_N = []
-    all_CA = []
-    all_C = []
-    
+    chain_data = []
     start_idx = 0
-    for i, ss in enumerate(chain_ss_list):
+    total_residues = 0
+    
+    # Prepare chain data
+    for ss in chain_ss_list:
         L = len(ss)
         sub_seq = sequence[start_idx : start_idx + L]
         start_idx += L
+        phi0, psi0 = ss_to_phi_psi(ss)
+        chain_data.append((sub_seq, ss, phi0, psi0))
+        total_residues += L
         
-        coords = _optimize_single_chain_coords(sub_seq, ss, iters=iters)
-        if coords is None:
-            return False
-            
-        N, CA, C = coords
-        
-        # Offset subsequent chains to avoid visual overlap (simulate separate molecules)
-        # Shift along X axis by 30A * chain_index
-        offset = np.array([30.0 * i, 0.0, 0.0])
-        all_N.append(N + offset)
-        all_CA.append(CA + offset)
-        all_C.append(C + offset)
+    # Initialize variables
+    # [phi_1..N, psi_1..N, (tx,ty,tz,rx,ry,rz)_2..M]
+    num_chains = len(chain_ss_list)
+    num_rb = (num_chains - 1) * 6
     
-    # Concatenate coordinates
-    final_N = np.concatenate(all_N)
-    final_CA = np.concatenate(all_CA)
-    final_C = np.concatenate(all_C)
+    best_x = None
+    best_val = 1e9
+    
+    for _ in range(iters):
+        # Initial guess
+        phi_init = []
+        psi_init = []
+        for _, _, p, q in chain_data:
+            phi_init.append(p + np.random.uniform(-0.1, 0.1, len(p)))
+            psi_init.append(q + np.random.uniform(-0.1, 0.1, len(q)))
         
-    # Calculate chain breaks (cumulative indices)
+        rb_init = []
+        if num_chains > 1:
+            # Randomize initial positions for chains > 0
+            for k in range(num_chains - 1):
+                # Random translation +/- 20A
+                t = np.random.uniform(-20, 20, 3)
+                # Random rotation
+                r = np.random.uniform(-np.pi, np.pi, 3)
+                rb_init.extend(t)
+                rb_init.extend(r)
+                
+        x0 = np.concatenate([np.concatenate(phi_init), np.concatenate(psi_init), np.array(rb_init)])
+        
+        # Bounds
+        bounds = [(-np.pi, np.pi)] * (2 * total_residues)
+        if num_rb > 0:
+            # Unbounded translation, but let's loose bound it
+            bounds.extend([(-100, 100)] * 3 + [(-np.pi, np.pi)] * 3)
+            # Repeat for each chain
+            bounds = bounds[:2*total_residues] + (bounds[2*total_residues:] * (num_chains - 1))
+
+        try:
+            res = minimize(_objective_joint, x0, args=(chain_data, total_residues),
+                          method="L-BFGS-B",
+                          options={'maxiter': 300, 'ftol': 1e-4, 'disp': False},
+                          bounds=bounds)
+            
+            if res.fun < best_val:
+                best_val = res.fun
+                best_x = res.x
+        except Exception:
+            pass
+            
+    if best_x is None:
+        best_x = x0 # Fallback
+        
+    # Reconstruct final structure
+    phi_all = best_x[:total_residues]
+    psi_all = best_x[total_residues : 2*total_residues]
+    rb_params = best_x[2*total_residues:]
+    
+    final_N, final_CA, final_C = [], [], []
+    idx = 0
+    rb_idx = 0
+    
+    for i, (seq, _, _, _) in enumerate(chain_data):
+        n = len(seq)
+        phi = phi_all[idx : idx+n]
+        psi = psi_all[idx : idx+n]
+        idx += n
+        
+        N_c, CA_c, C_c = build_backbone(seq, phi, psi)
+        
+        if i > 0:
+            params = rb_params[rb_idx : rb_idx+6]
+            rb_idx += 6
+            N_c = _apply_transform(N_c, params[:3], params[3:])
+            CA_c = _apply_transform(CA_c, params[:3], params[3:])
+            C_c = _apply_transform(C_c, params[:3], params[3:])
+            
+        final_N.append(N_c)
+        final_CA.append(CA_c)
+        final_C.append(C_c)
+        
+    final_N = np.concatenate(final_N)
+    final_CA = np.concatenate(final_CA)
+    final_C = np.concatenate(final_C)
+    
     breaks = []
     acc = 0
     for L in lengths[:-1]:

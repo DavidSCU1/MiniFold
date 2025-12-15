@@ -185,36 +185,9 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                         generate_html_view(pdb_path, html_path)
                         generated_pdbs.append({"pdb": pdb_name, "html": html_name, "chains": len(chains), "case": case_idx, "prob": prob})
                         
-                        # --- Assembly Step ---
-                        # Only run if multiple chains exist
-                        if len(chains) > 1:
-                            try:
-                                log_callback(f"  > Case {case_idx}: Assembling complex (folding together)...")
-                                parsed_chains = parse_pdb_chains(pdb_path)
-                                if parsed_chains and len(parsed_chains) > 1:
-                                    assembled = assemble_chains(parsed_chains)
-                                    
-                                    complex_suffix = f"case{case_idx}_model_{rank}_complex"
-                                    complex_pdb_name = f"{prefix}_{complex_suffix}.pdb"
-                                    complex_pdb_path = os.path.join(three_d_dir, complex_pdb_name)
-                                    
-                                    write_complex_pdb(assembled, sequence, complex_pdb_path)
-                                    
-                                    complex_html_name = f"{prefix}_{complex_suffix}.html"
-                                    complex_html_path = os.path.join(three_d_dir, complex_html_name)
-                                    generate_html_view(complex_pdb_path, complex_html_path)
-                                    
-                                    generated_pdbs.append({
-                                        "pdb": complex_pdb_name, 
-                                        "html": complex_html_name, 
-                                        "chains": len(chains), 
-                                        "case": case_idx, 
-                                        "prob": prob,
-                                        "type": "complex"
-                                    })
-                            except Exception as e:
-                                log_callback(f"    Assembly Failed: {e}")
-                                traceback.print_exc()
+                        # Assembly step is now integrated into the predictor (Joint Optimization)
+                        # So we don't need separate assembly logic here.
+
 
             else:
                 log_callback("无保留案例，使用回退模型。")

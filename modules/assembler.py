@@ -177,7 +177,7 @@ def assemble_chains(chains, verbose=False):
 
     return final_chains
 
-from modules.sidechain_builder import build_sidechain
+from modules.sidechain_builder import pack_sidechain
 
 def write_complex_pdb(chains, original_sequence, out_path):
     """
@@ -187,6 +187,9 @@ def write_complex_pdb(chains, original_sequence, out_path):
     all_N = np.concatenate([c['N'] for c in chains])
     all_CA = np.concatenate([c['CA'] for c in chains])
     all_C = np.concatenate([c['C'] for c in chains])
+    
+    # Environment for sidechain packing (Backbone atoms of the entire complex)
+    env_atoms = np.vstack([all_N, all_CA, all_C])
     
     # We need to know where chains break to insert TER
     lengths = [len(c['CA']) for c in chains]
@@ -232,7 +235,7 @@ def write_complex_pdb(chains, original_sequence, out_path):
             # Sidechain + Oxygen
             # Build Sidechain
             if aa != "G":
-                sc_atoms = build_sidechain(aa, c_N[i], c_CA[i], c_C[i])
+                sc_atoms = pack_sidechain(aa, c_N[i], c_CA[i], c_C[i], env_atoms)
                 
                 # Approximate O (Backbone Carbonyl)
                 try:
