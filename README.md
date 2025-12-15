@@ -37,7 +37,7 @@ MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，
 - 运行时在 Web UI 勾选 “iGPU Acceleration” 或 CLI 使用 `--igpu` 即可启用；如需隔离依赖，可再配合 `--igpu-env <env_name>`。
 
 3. **配置环境变量**
-   在项目根目录创建 `.env` 文件（请勿上传到 GitHub），填写你的 API Key：
+   在项目根目录创建 `.env` 文件，填写你的 API Key：
    ```ini
    # DeepSeek (Volcengine)
    ARK_API_KEY=your_deepseek_api_key_here
