@@ -56,6 +56,14 @@ Unlike simple geometric builders, MiniFold's `igpu_predictor` is a differentiabl
 
    *Note: For Windows iGPU acceleration, ensure `torch-directml` is installed correctly.*
 
+4. **Configure Environment**
+   Create a `.env` file in the project root with your API Keys (optional if using UI):
+   ```ini
+   # Volcengine (Ark)
+   ARK_API_KEY=your_api_key_here
+   ARK_MODEL=doubao-pro-32k
+   ```
+
 ## Usage
 
 1. Start the Web Server:
