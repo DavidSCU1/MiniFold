@@ -4,8 +4,8 @@ import sys
 import json
 
 from modules.input_handler import load_fasta
-from modules.llm_module import analyze_sequence, deepseek_eval_case
-from modules.qwen_module import qwen_ss_candidates
+from modules.ss_generator import pybiomed_ss_candidates
+from modules.ark_module import ark_vote_cases, ark_analyze_sequence, get_default_models
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
@@ -69,67 +69,67 @@ def main():
     total_seqs = len(sequences)
     for idx, (seq_id, sequence) in enumerate(sequences):
         print(f"\nProcessing sequence: {seq_id}")
-        print_progress(10 + int((idx/total_seqs)*5), f"Processing sequence {seq_id}: Predicting SS (Qwen)")
+        print_progress(10 + int((idx/total_seqs)*5), f"Processing sequence {seq_id}: Predicting SS (PyBioMed)")
         safe_id = "".join([c if c.isalnum() else "_" for c in seq_id])
         
-        q_result = qwen_ss_candidates(sequence, args.env, num=args.ssn)
+        # 1. Generate Candidates
+        q_result = pybiomed_ss_candidates(sequence, args.env, num=args.ssn)
         print_progress(30, "Generated SS candidates")
         cases = q_result.get("cases", [])
         cand_file = os.path.join(workdir, f"{prefix}_ss_candidates.json")
         with open(cand_file, "w", encoding="utf-8") as f:
             json.dump(cases, f, ensure_ascii=False, indent=2)
-        raw_file = os.path.join(workdir, "raw_qwen.txt")
+        raw_file = os.path.join(workdir, "raw_candidates.txt")
         with open(raw_file, "w", encoding="utf-8") as f:
             f.write(q_result.get("raw", ""))
         
-        print_progress(35, "Verifying candidates (DeepSeek)")
-        kept_cases = []
-        total_cases = len(cases)
-        for i, case in enumerate(cases):
-            # Update progress within verification
-            p_val = 35 + int((i/total_cases) * 25) # 35% to 60%
-            print_progress(p_val, f"Verifying candidate {i+1}/{total_cases}")
+        # 2. Verify with Ark (Voting)
+        print_progress(35, "Verifying candidates (Ark)")
+        
+        models = get_default_models()
+        # Use simple voting
+        votes = ark_vote_cases(models, sequence, args.env, cases, req_text=req_text)
+        
+        votes_file = os.path.join(workdir, f"{prefix}_votes.json")
+        with open(votes_file, "w", encoding="utf-8") as f:
+            json.dump(votes, f, ensure_ascii=False, indent=2)
             
-            chains = case.get("chains") or []
-            if not chains:
-                continue
-            case_dir = os.path.join(workdir, f"case_{i+1}")
-            os.makedirs(case_dir, exist_ok=True)
-            chain_files = []
-            for m, ss in enumerate(chains):
-                path = os.path.join(case_dir, f"{prefix}_2_case{i+1}_{m+1}.fasta.txt")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(ss)
-                chain_files.append(os.path.basename(path))
-            p = deepseek_eval_case(sequence, args.env, chains, req_text=req_text)
-            meta = {"case": i+1, "p": p, "chains": len(chains), "files": chain_files}
-            meta_path = os.path.join(case_dir, f"case_{i+1}_meta.json")
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-            if isinstance(p, float) and p >= args.threshold:
-                kept_cases.append(meta)
-            else:
-                # remove case directory
-                try:
-                    for fn in chain_files:
-                        os.remove(os.path.join(case_dir, fn))
-                except Exception:
-                    pass
-                try:
-                    os.remove(meta_path)
-                except Exception:
-                    pass
-                try:
-                    os.rmdir(case_dir)
-                except Exception:
-                    pass
+        kept_cases = []
+        if votes.get("cases"):
+            for case_it in votes["cases"]:
+                avg_score = case_it.get("avg", 0.0)
+                idx = case_it.get("idx")
+                if avg_score >= args.threshold:
+                    # Reconstruct meta format expected by downstream
+                    # Original meta: {"case": i+1, "p": p, "chains": len(chains), "files": [...]}
+                    # We need to ensure chain files exist for visualization/folding
+                    
+                    case_data = cases[idx]
+                    chains = case_data.get("chains", [])
+                    case_dir = os.path.join(workdir, f"case_{idx+1}")
+                    os.makedirs(case_dir, exist_ok=True)
+                    chain_files = []
+                    for m, ss in enumerate(chains):
+                        path = os.path.join(case_dir, f"{prefix}_2_case{idx+1}_{m+1}.fasta.txt")
+                        with open(path, "w", encoding="utf-8") as f:
+                            f.write(ss)
+                        chain_files.append(os.path.basename(path))
+                        
+                    meta = {
+                        "case": idx+1, 
+                        "p": avg_score, 
+                        "chains": len(chains), 
+                        "files": chain_files
+                    }
+                    kept_cases.append(meta)
+
         kept_file = os.path.join(workdir, f"{prefix}_cases_kept.json")
         with open(kept_file, "w", encoding="utf-8") as f:
             json.dump(kept_cases, f, ensure_ascii=False, indent=2)
         
         print_progress(60, "Candidates verified. Analyzing sequence...")
         # 3. LLM Annotation
-        annotation = analyze_sequence(sequence)
+        annotation = ark_analyze_sequence(sequence)
         annotation_file = os.path.join(workdir, f"{prefix}_annotation.txt")
         with open(annotation_file, "w", encoding='utf-8') as f:
             f.write(annotation)
@@ -367,7 +367,7 @@ def main():
             f.write(f"# MiniFold Analysis Report: {seq_id}\n\n")
             f.write("## Sequence\n")
             f.write("```\n" + sequence + "\n```\n\n")
-            f.write("## Secondary Structure Candidates (Qwen)\n")
+            f.write("## Secondary Structure Candidates (PyBioMed)\n")
             f.write(f"Saved: `{os.path.basename(cand_file)}`\n")
             f.write(f"Raw: `{os.path.basename(raw_file)}`\n\n")
             f.write("## Filtered by Qwen (Cases)\n")

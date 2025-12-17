@@ -48,7 +48,17 @@ def generate_html_view(pdb_file, output_html="structure.html"):
                 window.viewer.zoom(1.2, 1000);
             } catch (e) {
                 console.error(e);
-                element.innerHTML = '<p style="padding:20px;color:red;">Failed to render PDB: ' + e + '</p>';
+                element.innerHTML = '<p style="padding:12px;color:#ef4444;font-size:12px;">Failed to render PDB: ' + e + '<br/>Showing raw text below.</p>';
+                var pre = document.createElement('pre');
+                pre.style.fontFamily = 'monospace';
+                pre.style.fontSize = '11px';
+                pre.style.whiteSpace = 'pre-wrap';
+                pre.style.wordBreak = 'break-word';
+                pre.style.background = '#fff';
+                pre.style.color = '#111827';
+                pre.style.padding = '10px';
+                pre.textContent = pdbData;
+                element.appendChild(pre);
             }
         });
 

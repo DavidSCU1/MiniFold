@@ -1,10 +1,10 @@
 numpy
 scipy
 requests
-openai
 python-dotenv
 py3Dmol
 biopython
 py-cpuinfo
 torch
 torch-directml
+PyBioMed

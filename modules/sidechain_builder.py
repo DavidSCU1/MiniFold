@@ -1,5 +1,7 @@
 import numpy as np
 import math
+import os
+import json
 
 # Basic Sidechain Templates (Chi angles will be used to rotate them)
 # Coordinates relative to CA at origin, N on -x axis, C in xy plane.
@@ -44,6 +46,18 @@ ROTAMER_LIBRARY = {
     'VAL': [[180], [-60], [60]]
 }
 
+try:
+    _base_dir = os.path.dirname(os.path.dirname(__file__))
+    _dun_path = os.path.join(_base_dir, "data", "dunbrack2010.json")
+    if os.path.exists(_dun_path):
+        with open(_dun_path, "r", encoding="utf-8") as _f:
+            _lib = json.load(_f)
+            for k, v in _lib.items():
+                if isinstance(v, list) and all(isinstance(x, list) for x in v):
+                    ROTAMER_LIBRARY[k] = v
+except Exception:
+    pass
+
 # Compatibility alias for single-rotamer usage
 ROTAMERS = {k: v[0] for k, v in ROTAMER_LIBRARY.items()}
 
@@ -74,6 +88,8 @@ def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=
     for rot in options:
         atoms = build_sidechain(aa_code, n_coord, ca_coord, c_coord, rot)
         clash_score = 0.0
+        heavy_loss = 0.0
+        lj_sum = 0.0
         
         # Check clashes against environment
         if local_environment_atoms is not None and len(local_environment_atoms) > 0:
@@ -97,23 +113,66 @@ def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=
             # For typical proteins (M < 5000), it's fine.
             
             diff = sc_coords[:, np.newaxis, :] - env[np.newaxis, :, :]
-            dists = np.linalg.norm(diff, axis=2)
-            
-            # Count clashes (dist < 1.5 Angstrom)
-            # Ignore self (dist < 0.1)
+            dists = np.linalg.norm(diff, axis=2) + 1e-6
             clashes = np.sum((dists < 1.5) & (dists > 0.1))
-            clash_score = clashes
-            
-        if clash_score < min_clash:
-            min_clash = clash_score
+            clash_score = float(clashes)
+            heavy_loss = float(np.sum(np.maximum(0.0, 2.6 - dists) ** 2))
+            sigma = 4.0
+            epsilon = 0.05
+            r = np.clip(dists, 0.5, None)
+            lj = epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
+            lj_sum = float(np.sum(lj))
+        score = clash_score * 5.0 + heavy_loss * 1.0 + lj_sum * 0.2
+        if score < min_clash:
+            min_clash = score
             best_atoms = atoms
-            
+            best_rot = rot
+        
         # If perfect score, break early (greedy)
         if min_clash == 0:
             break
             
     if best_atoms is not None:
+        if local_environment_atoms is not None and len(local_environment_atoms) > 0:
+            refined = _refine_chi(aa_code, n_coord, ca_coord, c_coord, best_rot, local_environment_atoms)
+            if refined is not None:
+                return refined
         return best_atoms
+
+def _score_atoms(sc_coords, env):
+    diff = sc_coords[:, np.newaxis, :] - env[np.newaxis, :, :]
+    dists = np.linalg.norm(diff, axis=2) + 1e-6
+    clashes = np.sum((dists < 1.5) & (dists > 0.1))
+    heavy_loss = float(np.sum(np.maximum(0.0, 2.6 - dists) ** 2))
+    sigma = 4.0
+    epsilon = 0.05
+    r = np.clip(dists, 0.5, None)
+    lj = epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
+    lj_sum = float(np.sum(lj))
+    return clashes * 5.0 + heavy_loss * 1.0 + lj_sum * 0.2
+
+def _refine_chi(aa_code, n_coord, ca_coord, c_coord, chi_angles, env):
+    if chi_angles is None or len(chi_angles) == 0:
+        return None
+    env_arr = env if isinstance(env, np.ndarray) else np.array(env)
+    base_atoms = build_sidechain(aa_code, n_coord, ca_coord, c_coord, chi_angles)
+    base_coords = np.array(list(base_atoms.values()))
+    best_score = _score_atoms(base_coords, env_arr)
+    best_atoms = base_atoms
+    chis = np.array(chi_angles, dtype=float)
+    for scale in [10.0, 5.0]:
+        for _ in range(16):
+            trial = chis + (np.random.rand(len(chis)) - 0.5) * 2.0 * scale
+            atoms = build_sidechain(aa_code, n_coord, ca_coord, c_coord, list(trial))
+            sc = np.array(list(atoms.values()))
+            if len(sc) == 0:
+                continue
+            s = _score_atoms(sc, env_arr)
+            if s < best_score:
+                best_score = s
+                best_atoms = atoms
+                chis = trial
+    return best_atoms
 
 def place_atom_nerf(a, b, c, bond_len, bond_angle, torsion):
     """

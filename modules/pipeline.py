@@ -5,14 +5,14 @@ import traceback
 import json
 from modules.env_loader import load_env
 from modules.input_handler import load_fasta
-from modules.qwen_module import qwen_ss_candidates
-from modules.llm_module import analyze_sequence, deepseek_eval_case
+from modules.ss_generator import pybiomed_ss_candidates
+from modules.ark_module import ark_vote_cases, get_default_models, ark_refine_structure, ark_extract_constraints, ark_analyze_sequence
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
+from modules.igpu_predictor import check_gpu_availability
 from modules.visualization import generate_html_view
-from modules.assembler import parse_pdb_chains, assemble_chains, write_complex_pdb
 
-def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name, log_callback=print):
+def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name, target_chains=None, log_callback=print):
     """
     Core MiniFold pipeline execution logic.
     
@@ -25,6 +25,7 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
         use_igpu: Whether to use iGPU acceleration
         use_ext_env: Whether to use external environment
         ext_env_name: Name/path of external environment
+        target_chains: Enforce specific number of chains (optional)
         log_callback: Function to handle log messages (default: print)
     """
     try:
@@ -48,60 +49,180 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
             f"ssn={ssn}",
             f"threshold={threshold}",
         ]
+        if target_chains:
+            req_lines.append(f"target_chains={target_chains}")
+            
         os.makedirs(workdir, exist_ok=True)
         with open(req_path, "w", encoding="utf-8") as f:
             f.write("\n".join(req_lines))
         with open(req_path, "r", encoding="utf-8") as f:
             req_text = f.read()
 
+        gpu_ok, gpu_name, gpu_type = check_gpu_availability()
+        auto_igpu = bool(use_igpu or gpu_ok or (use_ext_env and ext_env_name))
         for seq_id, sequence in sequences:
             log_callback(f"处理序列: {seq_id} (长度 {len(sequence)})")
-            q_result = qwen_ss_candidates(sequence, env_text, num=ssn)
+            q_result = pybiomed_ss_candidates(sequence, env_text, num=ssn, target_chains=target_chains)
             cases = q_result.get("cases", [])
             cand_file = os.path.join(workdir, f"{prefix}_ss_candidates.json")
             with open(cand_file, "w", encoding="utf-8") as f:
                 json.dump(cases, f, ensure_ascii=False, indent=2)
-            raw_file = os.path.join(workdir, "raw_qwen.txt")
+            raw_file = os.path.join(workdir, "raw_candidates.txt")
             with open(raw_file, "w", encoding="utf-8") as f:
                 f.write(q_result.get("raw", ""))
-            log_callback(f"Qwen 候选生成完成，尝试数 {q_result.get('attempts', 0)}，行数 {q_result.get('lines', 0)}。")
+            log_callback(f"候选生成完成，尝试数 {q_result.get('attempts', 0)}，行数 {q_result.get('lines', 0)}。")
+            if q_result.get('logs'):
+                for l in q_result['logs']:
+                    log_callback(f"  [SS-Gen Log] {l}")
+
+            models = get_default_models()
+            api_key = os.environ.get("ARK_API_KEY", "")
+            if not api_key:
+                log_callback("Ark 投票未配置 API Key，继续本地流程并写入空投票结果。")
+            votes = ark_vote_cases(models, sequence, env_text, cases, req_text=req_text)
+            votes_file = os.path.join(workdir, f"{prefix}_votes.json")
+            with open(votes_file, "w", encoding="utf-8") as f:
+                json.dump(votes, f, ensure_ascii=False, indent=2)
+            best_idx = votes.get("best_idx", -1)
+            best_score = votes.get("best_score", 0.0)
+            try:
+                attempted = len(models)
+                succeeded_models = set()
+                for it in votes.get("cases", []):
+                    for mm in it.get("models", []):
+                        succeeded_models.add(mm.get("model"))
+                succeeded = len(succeeded_models)
+                log_callback(f"Ark 投票完成：共尝试 {attempted} 个模型，成功 {succeeded} 个，最佳分 {best_score:.2f}")
+                
+                # Detailed voting results
+                if votes.get("cases"):
+                    for case_it in votes["cases"]:
+                        idx = case_it.get("idx") + 1
+                        log_callback(f"  Case {idx}: Avg={case_it.get('avg', 0):.2f}, Med={case_it.get('med', 0):.2f}")
+                        for m_res in case_it.get("models", []):
+                            if m_res.get('p', -1) >= 0:
+                                log_callback(f"    - {m_res['model']}: {m_res['p']:.2f}")
+                            else:
+                                log_callback(f"    - {m_res['model']}: FAILED ({m_res.get('error', 'unknown')})")
+            except Exception:
+                pass
 
             kept_cases = []
-            for i, case in enumerate(cases):
+            
+            # Logic Branch: Environment-Aware Refinement vs Standard Selection
+            if env_text and cases:
+                log_callback(f"检测到环境描述，启动【主考官优化-重审】流程...")
+                
+                # 1. Identify Top 3 Candidates from Initial Vote
+                sorted_cases = sorted(votes.get("cases", []), key=lambda x: (x.get("avg", 0) + x.get("med", 0))/2, reverse=True)
+                top_3_indices = [x["idx"] for x in sorted_cases[:3]]
+                log_callback(f"  选取初选前三名 (Cases {[i+1 for i in top_3_indices]}) 进行优化...")
+                
+                chief_model = "doubao-seed-1-6-251015"
+                refined_candidates = []
+                
+                # 2. Chief Examiner Refines Each (Parallel Execution)
+                import concurrent.futures
+                
+                def refine_task(idx, i):
+                    if idx >= len(cases): return None
+                    case = cases[idx]
+                    chains = case.get("chains", [])
+                    log_callback(f"  [优化 {i+1}/3] 主考官 ({chief_model}) 正在调整 Case {idx+1} 以适应环境...")
+                    r_chains, r_err = ark_refine_structure(chief_model, sequence, env_text, chains, api_key=api_key)
+                    if r_chains:
+                        return {
+                            "origin_idx": idx,
+                            "chains": r_chains,
+                            "label": f"Refined_from_Case_{idx+1}"
+                        }
+                    else:
+                        log_callback(f"    优化失败 (Case {idx+1}): {r_err}")
+                        return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = [executor.submit(refine_task, idx, i) for i, idx in enumerate(top_3_indices)]
+                    for f in concurrent.futures.as_completed(futures):
+                        try:
+                            res = f.result()
+                            if res:
+                                refined_candidates.append(res)
+                        except Exception as e:
+                            log_callback(f"    优化任务异常: {e}")
+                
+                # Sort refined candidates to match input order if needed, but not strictly necessary for re-voting
+                
+                # 3. Re-voting by Jury (excluding Chief)
+                if refined_candidates:
+                    jury_models = [m for m in models if m != chief_model]
+                    if not jury_models: jury_models = models # Fallback
+                    
+                    log_callback(f"  [重审] {len(jury_models)} 位评审正在对 {len(refined_candidates)} 个优化后结构进行盲审...")
+                    
+                    vote_input_cases = [{"chains": rc["chains"]} for rc in refined_candidates]
+                    new_votes = ark_vote_cases(jury_models, sequence, env_text, vote_input_cases, req_text=req_text, api_key=api_key)
+                    
+                    best_new_idx = new_votes.get("best_idx", -1)
+                    best_new_score = new_votes.get("best_score", 0.0)
+                    
+                    log_callback(f"  重审结果: 最高分 {best_new_score:.2f}")
+                    
+                    if best_new_idx >= 0 and best_new_idx < len(refined_candidates):
+                        winner = refined_candidates[best_new_idx]
+                        log_callback(f"  >>> 最终优胜: {winner['label']} (Origin Case {winner['origin_idx']+1})")
+                        
+                        # Save Winner
+                        case_dir = os.path.join(workdir, "case_final")
+                        os.makedirs(case_dir, exist_ok=True)
+                        chain_files = []
+                        for m, ss in enumerate(winner["chains"]):
+                            path = os.path.join(case_dir, f"{prefix}_final_{m+1}.fasta.txt")
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(ss)
+                            chain_files.append(os.path.basename(path))
+                        
+                        final_meta = {
+                            "case": "final",
+                            "p": float(best_new_score),
+                            "chains": len(winner["chains"]),
+                            "files": chain_files,
+                            "origin_case": winner["origin_idx"] + 1
+                        }
+                        with open(os.path.join(case_dir, "case_final_meta.json"), "w", encoding="utf-8") as f:
+                            json.dump(final_meta, f, ensure_ascii=False, indent=2)
+                        
+                        if best_new_score >= threshold:
+                            kept_cases.append(final_meta)
+                        else:
+                            log_callback(f"  警告: 最终优胜得分 {best_new_score:.2f} 仍低于阈值 {threshold}，但将作为最佳结果保留。")
+                            kept_cases.append(final_meta)
+                    else:
+                        log_callback("  重审未产生有效赢家，回退到原始最佳案例。")
+                else:
+                    log_callback("  所有优化尝试均失败，回退到原始最佳案例。")
+
+            # Fallback / Standard Logic (If no env, or if optimization completely failed/yielded nothing)
+            if not kept_cases and isinstance(best_idx, int) and best_idx >= 0 and best_idx < len(cases):
+                log_callback(f"  使用原始最佳案例 Case {best_idx+1} (Score: {best_score:.2f})")
+                case = cases[best_idx]
                 chains = case.get("chains") or []
-                if not chains:
-                    continue
-                case_dir = os.path.join(workdir, f"case_{i+1}")
+                case_dir = os.path.join(workdir, f"case_{best_idx+1}")
                 os.makedirs(case_dir, exist_ok=True)
                 chain_files = []
                 for m, ss in enumerate(chains):
-                    path = os.path.join(case_dir, f"{prefix}_2_case{i+1}_{m+1}.fasta.txt")
+                    path = os.path.join(case_dir, f"{prefix}_2_case{best_idx+1}_{m+1}.fasta.txt")
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(ss)
                     chain_files.append(os.path.basename(path))
-                p = deepseek_eval_case(sequence, env_text, chains, req_text=req_text)
-                meta = {"case": i + 1, "p": p, "chains": len(chains), "files": chain_files}
-                meta_path = os.path.join(case_dir, f"case_{i+1}_meta.json")
+                meta = {"case": best_idx + 1, "p": float(best_score), "chains": len(chains), "files": chain_files}
+                meta_path = os.path.join(case_dir, f"case_{best_idx+1}_meta.json")
                 with open(meta_path, "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
-                if isinstance(p, float) and p >= threshold:
+                
+                if best_score >= threshold:
                     kept_cases.append(meta)
-                    log_callback(f"  保留案例 {i+1}，概率 {p:.2f}")
                 else:
-                    log_callback(f"  丢弃案例 {i+1}，概率 {p}")
-                    for fn in chain_files:
-                        try:
-                            os.remove(os.path.join(case_dir, fn))
-                        except Exception:
-                            pass
-                    try:
-                        os.remove(meta_path)
-                    except Exception:
-                        pass
-                    try:
-                        os.rmdir(case_dir)
-                    except Exception:
-                        pass
+                    log_callback(f"  原始最佳案例得分 {best_score:.2f} 低于阈值。")
 
             kept_file = os.path.join(workdir, f"{prefix}_cases_kept.json")
             with open(kept_file, "w", encoding="utf-8") as f:
@@ -112,6 +233,19 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
             with open(annotation_file, "w", encoding="utf-8") as f:
                 f.write(annotation)
             log_callback("功能注释完成。")
+
+            # Extract Constraints if env_text is present
+            constraints = []
+            if env_text:
+                log_callback("正在分析环境描述以提取物理约束...")
+                # Use the first available model or chief model
+                model_for_constraints = "doubao-seed-1-6-251015"
+                constraints, c_err = ark_extract_constraints(model_for_constraints, sequence, env_text, api_key=api_key)
+                if c_err:
+                    log_callback(f"约束提取警告: {c_err}")
+                    constraints = []
+                else:
+                    log_callback(f"提取到 {len(constraints)} 个物理约束: {[c.get('type') for c in constraints]}")
 
             generated_pdbs = []
             log_callback("生成 3D 结构...")
@@ -128,10 +262,10 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                     pdb_name = f"{prefix}_{suffix}.pdb"
                     pdb_path = os.path.join(three_d_dir, pdb_name)
                     
-                    if use_igpu:
+                    if auto_igpu:
                         if use_ext_env and ext_env_name:
                             log_callback(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU via external env '{ext_env_name}')...")
-                            igpu_input_data = {"sequence": sequence, "chains": chains}
+                            igpu_input_data = {"sequence": sequence, "chains": chains, "constraints": constraints}
                             tmp_input = os.path.join(workdir, f"igpu_input_case{case_idx}.json")
                             with open(tmp_input, "w", encoding="utf-8") as f:
                                 json.dump(igpu_input_data, f)
@@ -199,7 +333,7 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                 pdb_path = os.path.join(three_d_dir, pdb_name)
                 
                 success = False
-                if use_igpu:
+                if auto_igpu:
                     if use_ext_env and ext_env_name:
                         log_callback(f"  > Fallback: Optimizing backbone (iGPU via external env)...")
                         igpu_input_data = {"sequence": sequence, "chains": [s]}
@@ -241,7 +375,10 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                             except: pass
                     else:
                         log_callback(f"  > Fallback: Optimizing backbone (iGPU)...")
-                        success = run_igpu_fold(sequence, [s], pdb_path)
+                        success = run_igpu_fold(sequence, [s], pdb_path, constraints=constraints)
+                    if not success:
+                        log_callback("  > Fallback: iGPU path failed, trying Standard optimizer...")
+                        success = run_backbone_fold_multichain(sequence, [s], pdb_path)
                 else:
                     log_callback(f"  > Fallback: Optimizing backbone (Standard)...")
                     success = run_backbone_fold_multichain(sequence, [s], pdb_path)
@@ -259,6 +396,15 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                 f.write(f"# {prefix} 结构预测报告\n\n")
                 f.write(f"## 基本信息\n- 序列长度: {len(sequence)}\n- 候选生成数: {ssn}\n- 筛选阈值: {threshold}\n\n")
                 f.write("## 功能注释\n```\n" + annotation + "\n```\n\n")
+                f.write("## 投票与聚合\n")
+                try:
+                    f.write(f"- 最可信案例索引: {votes.get('best_idx', -1)}\n")
+                    f.write(f"- 聚合分数: {votes.get('best_score', 0.0):.2f}\n")
+                    f.write("- 候选评分概览:\n")
+                    for it in votes.get("cases", []):
+                        f.write(f"  - Case {it.get('idx')+1}: avg={it.get('avg',0.0):.2f}, med={it.get('med',0.0):.2f}, chains={it.get('chains',0)}\n")
+                except Exception:
+                    f.write("- 无可用投票数据\n")
                 f.write("## 结构模型\n")
                 if generated_pdbs:
                     f.write("| 模型 | 类型 | 概率 | 链数 | 文件 |\n|---|---|---|---|---|\n")

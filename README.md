@@ -3,13 +3,22 @@
 MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，专注于“最小可用预测器”思路。它利用大语言模型（LLM）进行二级结构预测与评估，结合经典的几何算法进行全原子 3D 建模与复合物组装。
 
 **核心特性：**
-- **LLM 驱动预测**：
-  - 使用 **Qwen** 生成符合长度约束的二级结构候选（H/E/C）。
-  - 使用 **DeepSeek** 评估每个候选的可靠性（概率打分）。
+- **LLM 驱动预测与投票**：
+  - **多策略候选生成**：使用 **PyBioMed 描述符（AAIndex 等）+ 残基倾向** 从 FASTA 序列生成多个二级结构候选。
+  - **Ark 多模型加权投票**：通过 **火山 Ark API** 同时调用多个 LLM（DeepSeek, Doubao, Kimi 等）作为“评审团”，对候选结构进行加权打分与投票，筛选出最符合生物学规律的折叠方案。
+    - 支持通过环境变量 `ARK_MODEL_WEIGHTS` 自定义各模型的投票权重。
+  - **环境感知优化 (Context-Aware Refinement)**：
+    - 当用户提供蛋白环境描述（如“膜蛋白”、“酸性环境”）时，系统会自动触发“主考官”模型（如 Doubao-Pro）对初选的前三名候选结构进行针对性调整，以适应特定环境。
+    - 默认模型集：`doubao-seed-1-6-251015`、`deepseek-v3-2-251201`、`doubao-1-5-pro-256k-250115`、`kimi-k2-thinking-251104`、`deepseek-r1-250528`。
+    - 支持环境变量自定义模型与权重。
 - **全原子 3D 建模 (Full-Atom)**：
   - 不仅重建 N-CA-C 骨架，还利用 **NeRF (Natural Extension Reference Frame)** 算法和几何模板自动构建所有侧链原子及骨架氧原子，提供完整的化学细节。
 - **复合物组装 (Complex Assembly)**：
   - 支持多链预测任务，使用 **L-BFGS-B** 优化算法，基于回转半径（Rg）和链间碰撞（Clash）最小化原则，自动将分散的链组装成紧凑的复合物结构。
+- **iGPU 加速与性能优化**：
+  - **DirectML 支持**：利用 `torch-directml` 实现跨平台（Intel/AMD/NVIDIA）GPU 加速。
+  - **向量化计算**：核心优化算法采用完全向量化的张量操作（Vectorized Tensor Ops），替代传统循环，大幅提升能量计算效率。
+  - **智能快照**：优化了优化过程中的 I/O 策略，在保证收敛可视化的同时减少磁盘写入开销。
 - **现代化交互界面**：
   - 提供 CLI、GUI 和 Web UI 三种使用方式。
   - **Web UI** 支持实时进度条显示、任务节点追踪、ETA 预估以及交互式 3D 可视化（Cartoon + Sticks 模式）。
@@ -39,15 +48,12 @@ MiniFold 是一个基于 Python 的轻量级蛋白结构分析与建模流程，
 3. **配置环境变量**
    在项目根目录创建 `.env` 文件（请勿上传到 GitHub），填写你的 API Key：
    ```ini
-   # DeepSeek (Volcengine)
-   ARK_API_KEY=your_deepseek_api_key_here
-   ARK_MODEL=deepseek-v3-2-251201
+   # Ark (Volcengine)
+  ARK_API_KEY=your_volcengine_api_key_here
    ARK_API_URL=https://ark.cn-beijing.volces.com/api/v3/chat/completions
-
-   # Qwen (DashScope)
-   DASHSCOPE_API_KEY=your_qwen_api_key_here
-   QWEN_MODEL=qwen3-max
-   QWEN_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+   # 可选：多模型与权重（逗号分隔，一一对应）
+   ARK_MODELS=doubao-seed-1-6-251015,deepseek-v3-2-251201,doubao-1-5-pro-256k-250115,kimi-k2-thinking-251104,deepseek-r1-250528
+   ARK_MODEL_WEIGHTS=1,1,1,1,1
    ```
 
 ## 使用指南
@@ -89,7 +95,7 @@ python minifold.py test.fasta --env "cytosolic protein" --ssn 5 --threshold 0.3 
 **参数说明：**
 - `--env`: 蛋白环境描述（如 "membrane protein", "cytosolic"），辅助 LLM 判断。
 - `--ssn`: 生成的二级结构候选数量（默认 5）。
-- `--threshold`: DeepSeek 评估的保留阈值（0-1，默认 0.5）。
+- `--threshold`: Ark 投票的保留评分阈值（0-1，默认 0.5）。
 - `--igpu`: 启用 iGPU 加速（如支持）。
 - `--igpu-env`: 指定 iGPU 模块运行的 Conda 环境名称。
 

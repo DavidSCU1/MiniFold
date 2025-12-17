@@ -27,12 +27,15 @@ def main():
             
         sequence = data["sequence"]
         chains = data["chains"]
+        constraints = data.get("constraints", None)
         
         print(f"[iGPU Runner] Processing sequence length {len(sequence)} with {len(chains)} chains...")
+        if constraints:
+            print(f"[iGPU Runner] Applying {len(constraints)} physical constraints.")
         
         # Run optimization
         # The run_backbone_fold_multichain function returns True on success
-        success = run_backbone_fold_multichain(sequence, chains, args.output)
+        success = run_backbone_fold_multichain(sequence, chains, args.output, constraints=constraints)
         
         if success:
             print(f"[iGPU Runner] Success. Output written to {args.output}")

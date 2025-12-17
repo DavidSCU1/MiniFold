@@ -11,12 +11,32 @@ from urllib.parse import urlparse, parse_qs
 import tkinter as tk
 from tkinter import filedialog
 import importlib.util
+import sys
+if 'sys' in globals():
+    ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.dirname(ROOT_DIR)
+    if PROJECT_ROOT not in sys.path:
+        sys.path.append(PROJECT_ROOT)
 
 # Configuration
 PORT = 9000
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(ROOT_DIR)
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+import types
+def ensure_local_modules_package():
+    modules_dir = os.path.join(PROJECT_ROOT, "modules")
+    m = sys.modules.get("modules")
+    if m is None or not getattr(m, "__path__", None):
+        pkg = types.ModuleType("modules")
+        pkg.__path__ = [modules_dir]
+        sys.modules["modules"] = pkg
+    else:
+        p = list(getattr(m, "__path__", []))
+        if modules_dir not in p:
+            m.__path__ = [modules_dir] + p
 
 # Global State
 class AppState:
@@ -293,7 +313,17 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                     if os.path.exists(frames_dir):
                         try:
                             frame_files = [f for f in os.listdir(frames_dir) if f.endswith(".pdb")]
-                            trajectory_frames_count = len(frame_files)
+                            max_idx = 0
+                            for fn in frame_files:
+                                try:
+                                    name = fn.split(".")[0]
+                                    if name.startswith("frame_"):
+                                        num = int(name[6:])
+                                        if num > max_idx:
+                                            max_idx = num
+                                except:
+                                    pass
+                            trajectory_frames_count = max_idx
                             if frame_files:
                                 max_m = 0
                                 for fn in frame_files:
@@ -534,152 +564,56 @@ def run_minifold(data):
         
         state.add_log(f"Saved FASTA to {fasta_path}", "INFO")
 
-        # Build Command
-        script_path = os.path.join(PROJECT_ROOT, "minifold.py")
-        
-        # Base Command Logic
-        # 1. Default python (current env)
-        # 2. Global specific env (if configured)
-        
-        python_exec = sys.executable # Default
-        use_conda_wrapper = False
-        conda_env_name = None
-        
-        if data.get("useGlobalEnv") and data.get("globalEnvName"):
-            env_name = data.get("globalEnvName")
-            if os.sep in env_name:
-                python_exec = env_name
-            else:
-                use_conda_wrapper = True
-                conda_env_name = env_name
+        # Execute pipeline in-process to align with new SS generation and Ark voting
+        def logger(msg: str):
+            text = str(msg)
+            if "读取 FASTA" in text or "Loaded FASTA" in text:
+                state.update_progress(5, "Loaded FASTA sequences")
+            elif "候选生成完成" in text or "候选生成" in text:
+                state.update_progress(30, "Generated SS candidates")
+            elif "最可信案例" in text:
+                state.update_progress(45, "Voting and selection")
+            elif "功能注释完成" in text or "功能注释" in text:
+                state.update_progress(60, "Sequence annotation")
+            elif "生成 3D 结构" in text:
+                state.update_progress(65, "Generating 3D structures")
+            elif "报告已生成" in text:
+                state.update_progress(95, "Report generated")
+            state.add_log(text, "INFO")
 
-        # If iGPU is enabled AND has specific env, it overrides the global env for execution context
-        # BUT minifold.py handles the switch internally via subprocess if --igpu is passed?
-        # Actually, minifold.py runs the *whole* pipeline. 
-        # If user wants iGPU part to run in a specific env, we usually rely on minifold.py to call igpu_runner.py with that env?
-        # Let's check how minifold.py handles --igpu.
-        # It seems minifold.py currently just enables the flag. The actual environment switch logic for iGPU was in GUI/Launcher.
-        # So we should probably run the MAIN script in the "Global Env", and pass the "iGPU Env" name to minifold.py so IT can call the runner.
-        # Wait, minifold.py might not accept --igpu-env argument yet. 
-        # Let's assume for now we run the whole thing in the target environment if specified.
-        
-        # Correction based on user request: "Run global env, then iGPU module runs in ITS env"
-        # We need to pass the iGPU env name to minifold.py if it supports it.
-        # If minifold.py doesn't support --igpu-env, we might need to add it or wrap the execution differently.
-        # Looking at previous context, we added ext_env support to GUI which called run_pipeline.
-        # run_pipeline accepts `ext_env_name`.
-        # So we should pass this as an argument to minifold.py if we modify minifold.py to accept it, 
-        # OR we just rely on `minifold.py` to be the entry point.
-        
-        # Let's constructing the command:
-        # cmd = [] # Moved below
-        
-        # NOTE: We construct the command cleanly here to avoid logic duplication above
-        if sys.platform == "win32":
-            if use_conda_wrapper:
-                # "cmd /c conda run --no-capture-output -n env python -u script ..."
-                cmd = ["cmd", "/c", "conda", "run", "--no-capture-output", "-n", conda_env_name, "python", "-u", script_path, fasta_path]
-                
-                # Append common args
-                cmd.extend(["--outdir", state.output_dir_abs])
-                if data.get("envText"):
-                    cmd.extend(["--env", data.get("envText")])
-                cmd.extend(["--ssn", str(data.get("ssn", 5))])
-                cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
-                
-                if data.get("useIgpu"):
-                    cmd.append("--igpu")
-                    if data.get("useIgpuEnv") and data.get("igpuEnvName"):
-                        cmd.extend(["--igpu-env", data.get("igpuEnvName")])
-                
-                # Better to pass as string for shell=True
-                cmd_str = subprocess.list2cmdline(cmd)
-                use_shell = True
-                cmd_to_run = cmd_str
-            else:
-                # Direct python call
-                cmd = [python_exec, "-u", script_path, fasta_path]
-                cmd.extend(["--outdir", state.output_dir_abs])
-                if data.get("envText"):
-                    cmd.extend(["--env", data.get("envText")])
-                cmd.extend(["--ssn", str(data.get("ssn", 5))])
-                cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
-                
-                if data.get("useIgpu"):
-                    cmd.append("--igpu")
-                    if data.get("useIgpuEnv") and data.get("igpuEnvName"):
-                        cmd.extend(["--igpu-env", data.get("igpuEnvName")])
-
-                cmd_to_run = cmd
-                use_shell = False
-        else:
-             # Linux/Mac
-             if use_conda_wrapper:
-                 cmd = ["conda", "run", "--no-capture-output", "-n", conda_env_name, "python", "-u", script_path, fasta_path]
-             else:
-                 cmd = [python_exec, "-u", script_path, fasta_path]
-             
-             cmd.extend(["--outdir", state.output_dir_abs])
-             if data.get("envText"): cmd.extend(["--env", data.get("envText")])
-             cmd.extend(["--ssn", str(data.get("ssn", 5))])
-             cmd.extend(["--threshold", str(data.get("threshold", 0.5))])
-             
-             if data.get("useIgpu"):
-                cmd.append("--igpu")
-                if data.get("useIgpuEnv") and data.get("igpuEnvName"):
-                    cmd.extend(["--igpu-env", data.get("igpuEnvName")])
-
-             cmd_to_run = cmd
-             use_shell = False
-
-        state.add_log(f"Executing: {cmd_to_run}", "INFO")
-
-        process = subprocess.Popen(
-            cmd_to_run,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            cwd=PROJECT_ROOT,
-            universal_newlines=True,
-            shell=use_shell,
-            # Ensure we don't inherit handles that might conflict
-            close_fds=(sys.platform != "win32") 
-        )
-        
-        state.current_process = process
-        
-        # Read output
-        import re
-        progress_pattern = re.compile(r"\[PROGRESS\]\s+(\d+)%\s+-\s+(.*)")
-        
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                stripped = line.strip()
-                match = progress_pattern.search(stripped)
-                if match:
-                    percent = int(match.group(1))
-                    step = match.group(2)
-                    state.update_progress(percent, step)
-                    state.add_log(f"Progress: {percent}% - {step}", "INFO")
+        try:
+            ensure_local_modules_package()
+            from modules.pipeline import run_pipeline
+            from modules.env_loader import load_env
+            load_env(os.path.join(PROJECT_ROOT, ".env"))
+            use_ext_env = bool(data.get("useIgpuEnv") and data.get("igpuEnvName"))
+            target_chains_val = data.get("targetChains")
+            try:
+                if target_chains_val:
+                    target_chains_val = int(target_chains_val)
                 else:
-                    # Filter spam logs if needed
-                    state.add_log(stripped, "INFO")
-                    # Fallback check for debug:
-                    if "[PROGRESS]" in stripped:
-                         state.add_log(f"DEBUG: Found [PROGRESS] but regex failed on: '{stripped}'", "WARNING")
-        
-        process.wait()
-        
-        if state.stop_requested:
-            state.set_status("stopped")
-            state.add_log("Job stopped by user.", "WARNING")
-        elif process.returncode == 0:
+                    target_chains_val = None
+            except:
+                target_chains_val = None
+
+            run_pipeline(
+                fasta_path,
+                state.output_dir_abs,
+                data.get("envText"),
+                int(data.get("ssn", 5)),
+                float(data.get("threshold", 0.5)),
+                bool(data.get("useIgpu")),
+                use_ext_env,
+                data.get("igpuEnvName") if use_ext_env else None,
+                target_chains=target_chains_val,
+                log_callback=logger
+            )
             state.set_status("completed")
+            state.update_progress(100, "Completed")
             state.add_log("Job completed successfully.", "SUCCESS")
-        else:
+        except Exception as e:
             state.set_status("error")
-            state.add_log(f"Job failed with exit code {process.returncode}", "ERROR")
+            state.add_log(f"Pipeline Error: {str(e)}", "ERROR")
 
     except Exception as e:
         state.set_status("error")

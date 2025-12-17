@@ -8,8 +8,9 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from modules.env_loader import load_env
 from modules.input_handler import load_fasta
-from modules.qwen_module import qwen_ss_candidates
-from modules.llm_module import analyze_sequence, deepseek_eval_case
+from modules.ss_generator import pybiomed_ss_candidates
+from modules.llm_module import analyze_sequence
+from modules.ark_module import ark_eval_case
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
@@ -300,64 +301,78 @@ class MiniFoldGUI:
 
             for seq_id, sequence in sequences:
                 self.log(f"处理序列: {seq_id} (长度 {len(sequence)})")
-                q_result = qwen_ss_candidates(sequence, env_text, num=ssn)
+                
+                # 1. Generate Candidates (PyBioMed)
+                q_result = pybiomed_ss_candidates(sequence, env_text, num=ssn)
                 cases = q_result.get("cases", [])
                 cand_file = os.path.join(workdir, f"{prefix}_ss_candidates.json")
                 with open(cand_file, "w", encoding="utf-8") as f:
                     import json
-
                     json.dump(cases, f, ensure_ascii=False, indent=2)
-                raw_file = os.path.join(workdir, "raw_qwen.txt")
+                raw_file = os.path.join(workdir, "raw_candidates.txt")
                 with open(raw_file, "w", encoding="utf-8") as f:
                     f.write(q_result.get("raw", ""))
-                self.log(f"Qwen 候选生成完成，尝试数 {q_result.get('attempts', 0)}，行数 {q_result.get('lines', 0)}。")
+                self.log(f"候选生成完成，尝试数 {q_result.get('attempts', 0)}，行数 {q_result.get('lines', 0)}。")
+
+                # 2. Verify (Ark Voting)
+                self.log("正在进行 Ark 多模型投票验证...")
+                models = get_default_models()
+                votes = ark_vote_cases(models, sequence, env_text, cases, req_text=req_text)
+                
+                votes_file = os.path.join(workdir, f"{prefix}_votes.json")
+                with open(votes_file, "w", encoding="utf-8") as f:
+                    import json
+                    json.dump(votes, f, ensure_ascii=False, indent=2)
 
                 kept_cases = []
-                for i, case in enumerate(cases):
-                    chains = case.get("chains") or []
-                    if not chains:
-                        continue
-                    case_dir = os.path.join(workdir, f"case_{i+1}")
-                    os.makedirs(case_dir, exist_ok=True)
-                    chain_files = []
-                    for m, ss in enumerate(chains):
-                        path = os.path.join(case_dir, f"{prefix}_2_case{i+1}_{m+1}.fasta.txt")
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(ss)
-                        chain_files.append(os.path.basename(path))
-                    p = deepseek_eval_case(sequence, env_text, chains, req_text=req_text)
-                    meta = {"case": i + 1, "p": p, "chains": len(chains), "files": chain_files}
-                    meta_path = os.path.join(case_dir, f"case_{i+1}_meta.json")
-                    with open(meta_path, "w", encoding="utf-8") as f:
-                        import json
-
-                        json.dump(meta, f, ensure_ascii=False, indent=2)
-                    if isinstance(p, float) and p >= threshold:
-                        kept_cases.append(meta)
-                        self.log(f"  保留案例 {i+1}，概率 {p:.2f}")
-                    else:
-                        self.log(f"  丢弃案例 {i+1}，概率 {p}")
-                        for fn in chain_files:
-                            try:
-                                os.remove(os.path.join(case_dir, fn))
-                            except Exception:
+                if votes.get("cases"):
+                    for case_it in votes["cases"]:
+                        avg_score = case_it.get("avg", 0.0)
+                        idx = case_it.get("idx")
+                        
+                        # Prepare files for this case
+                        case_data = cases[idx]
+                        chains = case_data.get("chains", [])
+                        if not chains: continue
+                        
+                        case_dir = os.path.join(workdir, f"case_{idx+1}")
+                        os.makedirs(case_dir, exist_ok=True)
+                        chain_files = []
+                        for m, ss in enumerate(chains):
+                            path = os.path.join(case_dir, f"{prefix}_2_case{idx+1}_{m+1}.fasta.txt")
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(ss)
+                            chain_files.append(os.path.basename(path))
+                            
+                        meta = {
+                            "case": idx + 1, 
+                            "p": avg_score, 
+                            "chains": len(chains), 
+                            "files": chain_files
+                        }
+                        
+                        if avg_score >= threshold:
+                            kept_cases.append(meta)
+                            self.log(f"  保留案例 {idx+1}，评分 {avg_score:.2f}")
+                        else:
+                            self.log(f"  丢弃案例 {idx+1}，评分 {avg_score:.2f}")
+                            # Clean up
+                            for fn in chain_files:
+                                try: os.remove(os.path.join(case_dir, fn))
+                                except: pass
+                            try: 
+                                os.rmdir(case_dir)
+                            except: 
                                 pass
-                        try:
-                            os.remove(meta_path)
-                        except Exception:
-                            pass
-                        try:
-                            os.rmdir(case_dir)
-                        except Exception:
-                            pass
 
                 kept_file = os.path.join(workdir, f"{prefix}_cases_kept.json")
                 with open(kept_file, "w", encoding="utf-8") as f:
                     import json
-
                     json.dump(kept_cases, f, ensure_ascii=False, indent=2)
 
-                annotation = analyze_sequence(sequence)
+                self.log("候选验证完成。正在分析序列功能...")
+                # 3. Annotation
+                annotation = ark_analyze_sequence(sequence)
                 annotation_file = os.path.join(workdir, f"{prefix}_annotation.txt")
                 with open(annotation_file, "w", encoding="utf-8") as f:
                     f.write(annotation)
@@ -503,7 +518,7 @@ class MiniFoldGUI:
                     f.write(f"# MiniFold Analysis Report: {seq_id}\n\n")
                     f.write("## Sequence\n")
                     f.write("```\n" + sequence + "\n```\n\n")
-                    f.write("## Secondary Structure Candidates (Qwen)\n")
+                    f.write("## Secondary Structure Candidates (PyBioMed)\n")
                     f.write(f"Saved: `{os.path.basename(cand_file)}`\n")
                     f.write(f"Raw: `{os.path.basename(raw_file)}`\n\n")
                     f.write("## Filtered by Qwen (Cases)\n")
