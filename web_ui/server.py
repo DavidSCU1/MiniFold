@@ -26,6 +26,57 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 import types
+
+def resolve_conda_env_to_python(env_name):
+    """
+    Attempt to resolve a conda environment name to its python executable path.
+    Returns None if not found.
+    """
+    # 1. Check if env_name is already a path
+    if os.sep in env_name or "/" in env_name:
+        if os.path.exists(env_name):
+             # check for python.exe
+             if os.path.isdir(env_name):
+                 py = os.path.join(env_name, "python.exe")
+                 if os.path.exists(py): return py
+                 py = os.path.join(env_name, "bin", "python") # linux/mac
+                 if os.path.exists(py): return py
+             elif os.path.isfile(env_name) and "python" in os.path.basename(env_name):
+                 return env_name
+        return None
+
+    # 2. Use conda info --json
+    try:
+        # Use shell=True for windows to find conda
+        cmd = ["conda", "info", "--envs", "--json"]
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', shell=True if sys.platform=='win32' else False)
+        if res.returncode != 0:
+            return None
+        
+        data = json.loads(res.stdout)
+        envs = data.get("envs", [])
+        
+        # Search for name match
+        for env_path in envs:
+            if os.path.basename(env_path).lower() == env_name.lower():
+                # Found it
+                py = os.path.join(env_path, "python.exe")
+                if os.path.exists(py): return py
+                py = os.path.join(env_path, "bin", "python")
+                if os.path.exists(py): return py
+        
+        # Handle "base"
+        if env_name.lower() == "base":
+             root = data.get("root_prefix")
+             if root:
+                 py = os.path.join(root, "python.exe")
+                 if os.path.exists(py): return py
+                 py = os.path.join(root, "bin", "python")
+                 if os.path.exists(py): return py
+    except:
+        pass
+    return None
+
 def ensure_local_modules_package():
     modules_dir = os.path.join(PROJECT_ROOT, "modules")
     m = sys.modules.get("modules")
@@ -564,56 +615,181 @@ def run_minifold(data):
         
         state.add_log(f"Saved FASTA to {fasta_path}", "INFO")
 
-        # Execute pipeline in-process to align with new SS generation and Ark voting
+        # Execute pipeline
+        # Check for Global Environment Override
+        use_global_env = bool(data.get("useGlobalEnv") and data.get("globalEnvName"))
+        global_env_name = data.get("globalEnvName")
+
         def logger(msg: str):
-            text = str(msg)
-            if "读取 FASTA" in text or "Loaded FASTA" in text:
+            text = str(msg).strip()
+            if not text: return
+            
+            # PARSE PROGRESS TAGS FROM MINIFOLD STDOUT
+            # Format: [PROGRESS] 30% - Step Name
+            if "[PROGRESS]" in text:
+                try:
+                    # Extract percentage and step name
+                    # Example: "[PROGRESS] 30% - Generated SS candidates"
+                    parts = text.split("[PROGRESS]")[-1].strip().split("%")
+                    if len(parts) >= 2:
+                        pct = int(parts[0].strip())
+                        step_name = parts[1].strip(" -:")
+                        state.update_progress(pct, step_name)
+                except:
+                    pass
+            
+            # Fallback heuristic for other logs (optional, but [PROGRESS] tag is preferred)
+            elif "读取 FASTA" in text or "Loaded FASTA" in text:
                 state.update_progress(5, "Loaded FASTA sequences")
-            elif "候选生成完成" in text or "候选生成" in text:
+            elif "候选生成完成" in text:
                 state.update_progress(30, "Generated SS candidates")
-            elif "最可信案例" in text:
+            elif "Ark 投票完成" in text:
                 state.update_progress(45, "Voting and selection")
-            elif "功能注释完成" in text or "功能注释" in text:
+            elif "功能注释完成" in text:
                 state.update_progress(60, "Sequence annotation")
             elif "生成 3D 结构" in text:
                 state.update_progress(65, "Generating 3D structures")
             elif "报告已生成" in text:
                 state.update_progress(95, "Report generated")
+                
             state.add_log(text, "INFO")
 
-        try:
-            ensure_local_modules_package()
-            from modules.pipeline import run_pipeline
-            from modules.env_loader import load_env
-            load_env(os.path.join(PROJECT_ROOT, ".env"))
-            use_ext_env = bool(data.get("useIgpuEnv") and data.get("igpuEnvName"))
+        if use_global_env:
+            state.add_log(f"Running in external environment: {global_env_name}", "INFO")
+            
+            # Construct command for minifold.py
+            cmd_args = [
+                "minifold.py",
+                fasta_path,
+                "--outdir", state.output_dir_abs,
+                "--ssn", str(data.get("ssn", 5)),
+                "--threshold", str(data.get("threshold", 0.5))
+            ]
+            
+            if data.get("envText"):
+                cmd_args.extend(["--env", data.get("envText")])
+                
+            if bool(data.get("useIgpu")):
+                cmd_args.append("--igpu")
+                # If running minifold.py externally, we pass igpu-env to it, 
+                # and it will handle the iGPU runner subprocess.
+                if bool(data.get("useIgpuEnv") and data.get("igpuEnvName")):
+                    cmd_args.extend(["--igpu-env", data.get("igpuEnvName")])
+            
+            # Pass target chains if present
             target_chains_val = data.get("targetChains")
             try:
-                if target_chains_val:
-                    target_chains_val = int(target_chains_val)
-                else:
-                    target_chains_val = None
+                # Convert to int to check validity, but keep as string for cmd
+                tc_int = int(target_chains_val)
+                if tc_int > 0:
+                    cmd_args.extend(["--target-chains", str(tc_int)])
+                    state.add_log(f"Enforcing Target Chains: {tc_int}", "INFO")
             except:
-                target_chains_val = None
+                pass
 
-            run_pipeline(
-                fasta_path,
-                state.output_dir_abs,
-                data.get("envText"),
-                int(data.get("ssn", 5)),
-                float(data.get("threshold", 0.5)),
-                bool(data.get("useIgpu")),
-                use_ext_env,
-                data.get("igpuEnvName") if use_ext_env else None,
-                target_chains=target_chains_val,
-                log_callback=logger
-            )
-            state.set_status("completed")
-            state.update_progress(100, "Completed")
-            state.add_log("Job completed successfully.", "SUCCESS")
-        except Exception as e:
-            state.set_status("error")
-            state.add_log(f"Pipeline Error: {str(e)}", "ERROR")
+            # Conda wrapper logic
+            final_cmd = []
+            
+            # Try to resolve python path first for better stability and unbuffered output
+            python_path = resolve_conda_env_to_python(global_env_name)
+            
+            if python_path:
+                state.add_log(f"Resolved environment '{global_env_name}' to: {python_path}", "INFO")
+                # Use -u for unbuffered output
+                final_cmd = [python_path, "-u"] + cmd_args
+            elif os.sep in global_env_name or "/" in global_env_name:
+                # Path to python executable provided directly
+                final_cmd = [global_env_name, "-u"] + cmd_args
+            else:
+                # Fallback to conda run
+                # We use 'conda run -n <env> python -u ...'
+                # Note: On Windows, capturing stdout from 'conda run' can sometimes be buffered or encoding-sensitive.
+                final_cmd = ["conda", "run", "-n", global_env_name, "python", "-u"] + cmd_args
+
+            # Execute with subprocess
+            try:
+                # On Windows, using shell=True for conda might be necessary if conda is not in PATH directly but via shell hook
+                use_shell = (sys.platform == "win32")
+                
+                # Setup environment variables to force UTF-8
+                env_vars = os.environ.copy()
+                env_vars["PYTHONIOENCODING"] = "utf-8"
+                env_vars["PYTHONUTF8"] = "1"
+                
+                process = subprocess.Popen(
+                    final_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=PROJECT_ROOT,
+                    bufsize=1,
+                    encoding='utf-8',
+                    errors='replace',
+                    shell=use_shell,
+                    env=env_vars
+                )
+                state.current_process = process
+                
+                # Read output loop
+                while True:
+                    if state.stop_requested:
+                        process.terminate()
+                        break
+                        
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line:
+                        logger(line.strip())
+                
+                rc = process.poll()
+                if rc == 0:
+                    state.set_status("completed")
+                    state.update_progress(100, "Completed")
+                    state.add_log("Job completed successfully.", "SUCCESS")
+                else:
+                    state.set_status("error")
+                    state.add_log(f"Job failed with exit code {rc}", "ERROR")
+            except Exception as e:
+                state.set_status("error")
+                state.add_log(f"Subprocess execution failed: {str(e)}", "ERROR")
+
+        else:
+            # Execute pipeline in-process (Original Logic)
+            try:
+                ensure_local_modules_package()
+                from modules.pipeline import run_pipeline
+                from modules.env_loader import load_env
+                load_env(os.path.join(PROJECT_ROOT, ".env"))
+                use_ext_env = bool(data.get("useIgpuEnv") and data.get("igpuEnvName"))
+                target_chains_val = data.get("targetChains")
+                try:
+                    if target_chains_val:
+                        target_chains_val = int(target_chains_val)
+                    else:
+                        target_chains_val = None
+                except:
+                    target_chains_val = None
+    
+                run_pipeline(
+                    fasta_path,
+                    state.output_dir_abs,
+                    data.get("envText"),
+                    int(data.get("ssn", 5)),
+                    float(data.get("threshold", 0.5)),
+                    bool(data.get("useIgpu")),
+                    use_ext_env,
+                    data.get("igpuEnvName") if use_ext_env else None,
+                    target_chains=target_chains_val,
+                    log_callback=logger
+                )
+                state.set_status("completed")
+                state.update_progress(100, "Completed")
+                state.add_log("Job completed successfully.", "SUCCESS")
+            except Exception as e:
+                state.set_status("error")
+                state.add_log(f"Pipeline Error: {str(e)}", "ERROR")
+
 
     except Exception as e:
         state.set_status("error")

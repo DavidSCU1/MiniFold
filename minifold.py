@@ -5,7 +5,7 @@ import json
 
 from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
-from modules.ark_module import ark_vote_cases, ark_analyze_sequence, get_default_models
+from modules.ark_module import ark_vote_cases, ark_analyze_sequence, get_default_models, ark_refine_structure
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5, help="Likelihood threshold for Qwen filter")
     parser.add_argument("--igpu", action="store_true", help="Enable iGPU acceleration")
     parser.add_argument("--igpu-env", default=None, help="Conda environment for iGPU execution")
+    parser.add_argument("--target-chains", type=int, default=None, help="Enforce specific number of chains (e.g. 1, 2)")
     
     args = parser.parse_args()
     
@@ -73,7 +74,10 @@ def main():
         safe_id = "".join([c if c.isalnum() else "_" for c in seq_id])
         
         # 1. Generate Candidates
-        q_result = pybiomed_ss_candidates(sequence, args.env, num=args.ssn)
+        # Pass target_chains to pybiomed_ss_candidates
+        if args.target_chains is not None and args.target_chains > 0:
+            print(f"Info: Enforcing target chain count = {args.target_chains}")
+        q_result = pybiomed_ss_candidates(sequence, args.env, num=args.ssn, target_chains=args.target_chains)
         print_progress(30, "Generated SS candidates")
         cases = q_result.get("cases", [])
         cand_file = os.path.join(workdir, f"{prefix}_ss_candidates.json")
@@ -90,6 +94,116 @@ def main():
         # Use simple voting
         votes = ark_vote_cases(models, sequence, args.env, cases, req_text=req_text)
         
+        # --- Refinement Loop Start ---
+        # User requested: Pick best -> Modify based on Env -> Re-vote -> Check threshold -> Repeat if needed
+        best_idx = votes.get("best_idx", -1)
+        
+        if best_idx != -1 and args.env:
+            refine_max_attempts = 3
+            refine_cnt = 0
+            
+            # Loop condition: 
+            # 1. First run (refine_cnt == 0) - Always try to incorporate env info
+            # 2. Score < Threshold - Keep trying until passed
+            # 3. Limit attempts
+            
+            while refine_cnt < refine_max_attempts:
+                best_score = votes.get("best_score", 0.0)
+                
+                # If we have refined at least once AND score is good enough, stop.
+                if refine_cnt > 0 and best_score >= args.threshold:
+                    print(f"  > Satisfaction reached ({best_score:.4f} >= {args.threshold}). Stopping refinement.")
+                    break
+                
+                refine_cnt += 1
+                best_case = cases[best_idx] # Always refine the current best
+                
+                print_progress(45, f"Refining best candidate (Attempt {refine_cnt}, Current Best={best_score:.4f})...")
+                
+                refiner_model = "doubao-seed-1-6-251015" 
+                if refiner_model not in models:
+                    refiner_model = models[0] # Fallback
+                    
+                print(f"  > Using {refiner_model} to refine structure based on environment: '{args.env}'")
+                
+                # We pass the *current best chains*.
+                refined_chains, err = ark_refine_structure(refiner_model, sequence, args.env, best_case["chains"], target_chains=args.target_chains)
+                
+                if refined_chains:
+                    # Check if chains changed? If identical, maybe stop?
+                    if refined_chains == best_case["chains"]:
+                        print("  > Refinement returned identical structure. Stopping.")
+                        break
+
+                    print(f"  > Refinement successful. Chains: {len(refined_chains)}")
+                    refined_case_idx = len(cases)
+                    refined_case = {"chains": refined_chains, "is_refined": True, "parent": best_idx, "round": refine_cnt}
+                    cases.append(refined_case)
+                    
+                    # Correctly set the index for the new vote result BEFORE calling ark_vote_cases
+                    # However, ark_vote_cases re-indexes starting from 0.
+                    # We need to manually patch the index in the result to match our main 'cases' list.
+                    
+                    # We pass [refined_case] which has index 0 in the sub-call.
+                    new_vote = ark_vote_cases(models, sequence, args.env, [refined_case], req_text=req_text)
+                    
+                    if new_vote["cases"]:
+                        res = new_vote["cases"][0]
+                        # Fix the index for display and storage
+                        res["idx"] = refined_case_idx
+                        
+                        # Manually print the correct Case ID log
+                        # The sub-call printed "Case 1", but it's actually "Case {refined_case_idx + 1}"
+                        print(f"[Ark Vote] (Correction) Above vote was for Refined Candidate {refined_case_idx + 1}")
+                        
+                        new_score = res["avg"]
+                        
+                        print(f"  > Refined Score: {new_score:.4f} (Previous Best: {best_score:.4f})")
+                        
+                        res["idx"] = refined_case_idx
+                        votes["cases"].append(res)
+                        
+                        # UPDATED LOGIC:
+                        # If refined score meets threshold, we accept it as the new best,
+                        # even if it's slightly lower than original (as long as it satisfies the user's constraints).
+                        # Or, strictly speaking, we want the structure that respects the Env.
+                        # Since refinement explicitly incorporates Env, we should prefer it if it's "good enough".
+                        # But for safety, let's stick to "if it improves OR is above threshold".
+                        
+                        is_better = new_score > best_score
+                        is_good_enough = new_score >= args.threshold
+                        
+                        if is_better or is_good_enough:
+                            if is_better:
+                                print(f"  > Refined candidate is BETTER. Replacing original top choice.")
+                            else:
+                                print(f"  > Refined candidate is GOOD ENOUGH (>{args.threshold}). Replacing original top choice to honor environment constraints.")
+                            
+                            # OVERWRITE LOGIC:
+                            # Instead of just pointing best_idx to the new case, we REPLACE the data in the original best case.
+                            # This ensures downstream logic (like 3D gen) uses the refined structure for the original Case ID.
+                            
+                            cases[best_idx] = refined_case # Overwrite original case data
+                            refined_case["idx"] = best_idx # Ensure internal index consistency
+                            
+                            # We also need to update the vote record for this index
+                            # Remove the old vote record for best_idx and append the new one
+                            votes["cases"] = [v for v in votes["cases"] if v["idx"] != best_idx]
+                            res["idx"] = best_idx
+                            votes["cases"].append(res)
+                            
+                            votes["best_idx"] = best_idx
+                            votes["best_score"] = new_score
+                            
+                            # Clean up the appended temporary case
+                            cases.pop() 
+                        else:
+                            print(f"  > Refined candidate did not improve score and is below threshold.")
+                else:
+                    print(f"  > Refinement failed: {err}")
+                    break # Stop on error
+        # --- Refinement Loop End ---
+
         votes_file = os.path.join(workdir, f"{prefix}_votes.json")
         with open(votes_file, "w", encoding="utf-8") as f:
             json.dump(votes, f, ensure_ascii=False, indent=2)
@@ -123,6 +237,18 @@ def main():
                     }
                     kept_cases.append(meta)
 
+        # STRICT TOP-1 POLICY (Moved Up):
+        # Sort and truncate kept_cases IMMEDIATELY after collection.
+        # This ensures only the best case is saved to disk and processed further.
+        if kept_cases:
+            # Sort by probability descending
+            kept_cases.sort(key=lambda x: x.get("p", 0.0), reverse=True)
+            
+            # Keep only the top 1
+            if len(kept_cases) > 1:
+                print(f"Info: Dropping {len(kept_cases)-1} suboptimal candidates. Keeping only the best (p={kept_cases[0].get('p'):.4f}).")
+                kept_cases = kept_cases[:1]
+
         kept_file = os.path.join(workdir, f"{prefix}_cases_kept.json")
         with open(kept_file, "w", encoding="utf-8") as f:
             json.dump(kept_cases, f, ensure_ascii=False, indent=2)
@@ -138,21 +264,65 @@ def main():
         print("\nGenerating 3D structures via Backbone Predictor...")
         print_progress(65, "Generating 3D Structures")
         generated_pdbs = []
+        # Strict Filtering: Ensure we ONLY process cases that are in kept_cases
+        # This prevents processing of obsolete or temporary cases that might have been created during refinement
+        # but not selected.
+        
+        # Note: kept_cases is already populated based on the FINAL state of votes['cases']
+        # which has been updated by the refinement loop (overwriting original indices).
+        # So iterating over kept_cases is correct.
+        
         if kept_cases:
+            # Sort by probability
             sorted_cases = sorted(kept_cases, key=lambda x: x.get("p", 0.0), reverse=True)
+            # Already truncated above, but safe to keep logic general
+            
+            # Additional safety: Verify that indices are valid and correspond to current 'cases' list
+            valid_sorted_cases = []
+            for meta in sorted_cases:
+                idx = meta.get("case") - 1 # meta['case'] is 1-based index
+                if 0 <= idx < len(cases):
+                    valid_sorted_cases.append(meta)
+            
+            # STRICT LIMIT: Only generate 3D structure for the TOP-1 case
+            # (Redundant now but harmless double-check)
+            if valid_sorted_cases:
+                valid_sorted_cases = valid_sorted_cases[:1]
+                
+            sorted_cases = valid_sorted_cases
             total_kept = len(sorted_cases)
+            
             for rank, meta in enumerate(sorted_cases, start=1):
                 # Update progress for 3D generation (65% -> 95%)
                 p_val = 65 + int(((rank-1)/total_kept) * 30)
                 print_progress(p_val, f"Generating 3D Structure {rank}/{total_kept}")
                 
                 prob = meta.get("p", 0.0)
-                case_idx = meta.get("case")
+                case_idx = meta.get("case") # This is the 1-based index from meta
+                
+                # Double check: does this index point to the correct data in 'cases'?
+                # Since we overwrote cases[best_idx] in refinement, cases[idx] holds the REFINED chains.
+                
                 case_dir = os.path.join(workdir, f"case_{case_idx}")
                 chains = []
-                for fn in meta.get("files", []):
-                    with open(os.path.join(case_dir, fn), "r", encoding="utf-8") as f:
-                        chains.append(f.read().strip())
+                
+                # Re-read chains from the FILES associated with this case
+                # Wait, if we refined, did we update the files on disk?
+                # The refinement loop updated 'cases' in memory but NOT the files on disk!
+                # We must use the chains from memory (cases[idx]["chains"]) instead of reading old files.
+                
+                # Fix: Use chains from memory
+                real_idx = case_idx - 1
+                memory_chains = cases[real_idx].get("chains", [])
+                
+                if memory_chains:
+                    chains = memory_chains
+                else:
+                    # Fallback to files if memory empty (shouldn't happen)
+                    for fn in meta.get("files", []):
+                        with open(os.path.join(case_dir, fn), "r", encoding="utf-8") as f:
+                            chains.append(f.read().strip())
+                
                 suffix = f"case{case_idx}_model_{rank}"
                 pdb_name = f"{prefix}_{suffix}.pdb"
                 pdb_path = os.path.join(three_d_dir, pdb_name)
@@ -190,12 +360,20 @@ def main():
                             # Execute
                             import subprocess
                             use_shell = (sys.platform == "win32")
+                            
+                            # Setup environment variables to force UTF-8 for subprocess
+                            env_vars = os.environ.copy()
+                            env_vars["PYTHONIOENCODING"] = "utf-8"
+                            env_vars["PYTHONUTF8"] = "1"
+                            
                             result = subprocess.run(
                                 cmd_str if sys.platform == "win32" else cmd_list,
                                 capture_output=True,
                                 text=True,
                                 encoding="utf-8",
-                                shell=use_shell
+                                errors='replace', # Ignore decode errors
+                                shell=use_shell,
+                                env=env_vars
                             )
                             
                             if result.stdout: print(f"[iGPU Output] {result.stdout.strip()}")

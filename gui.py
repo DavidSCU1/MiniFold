@@ -9,8 +9,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from modules.env_loader import load_env
 from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
-from modules.llm_module import analyze_sequence
-from modules.ark_module import ark_eval_case
+from modules.ark_module import ark_vote_cases, ark_analyze_sequence, get_default_models
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view

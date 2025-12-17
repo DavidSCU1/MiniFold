@@ -35,7 +35,8 @@ def main():
         
         # Run optimization
         # The run_backbone_fold_multichain function returns True on success
-        success = run_backbone_fold_multichain(sequence, chains, args.output, constraints=constraints)
+        # Note: constraints support removed or not available in current backend
+        success = run_backbone_fold_multichain(sequence, chains, args.output)
         
         if success:
             print(f"[iGPU Runner] Success. Output written to {args.output}")

@@ -6,7 +6,7 @@ import json
 from modules.env_loader import load_env
 from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
-from modules.ark_module import ark_vote_cases, get_default_models, ark_refine_structure, ark_extract_constraints, ark_analyze_sequence
+from modules.ark_module import ark_vote_cases, get_default_models, ark_refine_structure, ark_analyze_sequence
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.igpu_predictor import check_gpu_availability

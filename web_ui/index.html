@@ -558,9 +558,31 @@
                     }
                     viewer.render();
                     try { 
-                        viewer.animate({loop: "forward", interval: 50});
-                        if (currFrame != null && viewer.setFrame) {
-                            try { viewer.setFrame(currFrame); } catch (_) {}
+                        // Animate forward and stop at the last frame
+                        // loop: "forward" plays once? No, typically it loops.
+                        // We want to play once and stay at the end.
+                        // 3Dmol.js animate options: loop: "backward", "forward" (default loop), "rock"
+                        // It doesn't seem to have "once".
+                        // Workaround: Use a custom interval function or just set frame to last?
+                        // Actually, for trajectory visualization, looping is usually desired during generation.
+                        // But user complains "returns to the beginning".
+                        
+                        // Let's try to detect if it's the final result? 
+                        // If it's the final result (job completed), we should probably stop animation at the end.
+                        // But here we are in the middle of updates.
+                        
+                        // User said: "folded into a complex body and then returned to the beginning"
+                        // This implies the animation looped.
+                        // Let's stop the loop by setting reps: 1 if supported, or manually stopping.
+                        
+                        // 3Dmol.js doesn't officially support 'reps' in animate().
+                        // Let's just set the frame to the LAST frame always, instead of animating loop.
+                        // This makes it look like it's "growing" as new frames arrive, without looping back.
+                        
+                        viewer.stopAnimate();
+                        const models = viewer.models || [];
+                        if (models.length > 0) {
+                            viewer.setFrame(models.length - 1);
                         }
                     } catch (_) {}
                     state.lastPdbCacheKey = cacheKey;

@@ -1,10 +1,12 @@
-numpy
-scipy
-requests
-python-dotenv
-py3Dmol
-biopython
-py-cpuinfo
-torch
-torch-directml
-PyBioMed
+numpy>=1.24.0
+requests>=2.28.0
+volcengine>=1.0.0
+torch>=2.0.0
+# torch-directml is platform specific, listed here for Windows support but installation might vary
+# torch-directml>=0.1.13
+pybiomed>=1.0
+tqdm>=4.65.0
+flask>=2.2.0
+flask-cors>=3.0.0
+colorama>=0.4.6
+py-cpuinfo>=9.0.0

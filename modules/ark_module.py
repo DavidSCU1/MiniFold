@@ -10,45 +10,6 @@ def _ark_headers(api_key: Optional[str]) -> Dict[str, str]:
     key = api_key or os.environ.get("ARK_API_KEY", "")
     return {"Content-Type": "application/json", "Authorization": f"Bearer {key}"} if key else {"Content-Type": "application/json"}
 
-def ark_analyze_sequence(sequence: str, api_key: Optional[str] = None) -> str:
-    """
-    Uses Ark API to annotate the protein sequence.
-    """
-    url = _ark_endpoint()
-    headers = _ark_headers(api_key)
-    
-    prompt = f"""
-    You are an expert bioinformatician. Analyze the following protein sequence:
-    
-    Sequence:
-    {sequence}
-    
-    Please provide:
-    1. Potential domain structure.
-    2. Predicted function.
-    3. Active sites or key residues.
-    4. Subcellular localization (e.g. signal peptides).
-    """
-
-    payload = {
-        "model": "deepseek-v3-2-251201", # Default model for annotation
-        "messages": [
-            {"role": "system", "content": "你是人工智能助手."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-    
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-             return f"API Error: {json.dumps(data['error'])}"
-        content = data['choices'][0]['message']['content']
-        return content
-    except Exception as e:
-        return f"LLM Analysis Failed: {e}"
-
 def get_default_models() -> List[str]:
     env_models = os.environ.get("ARK_MODELS", "")
     if env_models:
@@ -123,13 +84,25 @@ def ark_eval_case(model: str, sequence: str, environment: Optional[str], chains:
     except Exception as e:
         return None, f"Network Error: {str(e)}"
 
-def ark_refine_structure(model: str, sequence: str, environment: str, chains: List[str], api_key: Optional[str] = None, timeout: int = 120) -> Tuple[Optional[List[str]], Optional[str]]:
+def ark_refine_structure(model: str, sequence: str, environment: str, chains: List[str], target_chains: Optional[int] = None, api_key: Optional[str] = None, timeout: int = 300) -> Tuple[Optional[List[str]], Optional[str]]:
     """
     Asks the model to refine the SS structure based on environment description.
     Returns (refined_chains, error_msg).
     """
     url = _ark_endpoint()
     headers = _ark_headers(api_key)
+    
+    # ... (Prompt construction remains same) ...
+    
+    chain_constraint = ""
+    if target_chains is not None and target_chains > 0:
+        chain_constraint = f"""
+5. CRITICAL CONSTRAINT: You MUST return a JSON list containing EXACTLY {target_chains} string(s). 
+   - Even if the structure suggests multiple domains, you MUST merge them into {target_chains} string(s).
+   - If target is 1, return ["...sequence..."].
+   - If target is 2, return ["...seq1...", "...seq2..."].
+   - VIOLATION OF THIS COUNT WILL CAUSE FAILURE.
+"""
     
     prompt = f"""
 Given the protein sequence (length {len(sequence)}) and environment description: "{environment}", 
@@ -143,6 +116,7 @@ Rules:
 2. The total length of residues (H/E/C) must exactly match the input sequence length.
 3. Consider the environment: e.g., if membrane, helices might be preferred; if high temp, structure might be more compact.
 4. Do not output any explanation, just the JSON list.
+{chain_constraint}
 """
 
     payload = {
@@ -153,34 +127,71 @@ Rules:
         ]
     }
     
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code != 200:
-            return None, f"Refine HTTP {r.status_code}: {r.text[:100]}"
-            
-        data = r.json()
-        if "error" in data:
-             return None, f"Refine API Error: {json.dumps(data['error'])}"
-             
-        s = (data["choices"][0]["message"]["content"] or "").strip()
-        
-        # Try to parse JSON list from response
-        # It might be wrapped in ```json ... ```
-        if "```" in s:
-            s = s.split("```")[1]
-            if s.startswith("json"): s = s[4:]
-            
+    # Retry logic
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            refined_chains = json.loads(s)
-            if isinstance(refined_chains, list) and all(isinstance(x, str) for x in refined_chains):
-                return refined_chains, None
-            else:
-                return None, "Invalid format: Not a list of strings"
-        except Exception:
-            return None, f"Refine Parse Error: Could not parse JSON from response"
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code != 200:
+                if attempt == max_retries - 1:
+                    return None, f"Refine HTTP {r.status_code}: {r.text[:100]}"
+                continue # Retry on HTTP error
+                
+            data = r.json()
+            if "error" in data:
+                 return None, f"Refine API Error: {json.dumps(data['error'])}"
+                 
+            s = (data["choices"][0]["message"]["content"] or "").strip()
             
-    except Exception as e:
-        return None, f"Refine Network Error: {str(e)}"
+            # Robust JSON parsing
+            # 1. Try extracting from markdown blocks ```json ... ``` or just ``` ... ```
+            if "```" in s:
+                parts = s.split("```")
+                # Look for the part that looks like a list
+                found_json = False
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("json"): 
+                        part = part[4:].strip()
+                    if part.startswith("[") and part.endswith("]"):
+                        s = part
+                        found_json = True
+                        break
+                # If not found in blocks, maybe the whole string is messy but contains []
+            
+            # 2. If simple parse fails, try regex to find the first list [...]
+            if not (s.startswith("[") and s.endswith("]")):
+                import re
+                match = re.search(r'\[.*\]', s, re.DOTALL)
+                if match:
+                    s = match.group(0)
+
+            try:
+                refined_chains = json.loads(s)
+                if isinstance(refined_chains, list) and all(isinstance(x, str) for x in refined_chains):
+                    return refined_chains, None
+                else:
+                    # Retry if format is wrong (e.g. object instead of list)
+                    if attempt == max_retries - 1:
+                        return None, f"Invalid format: Expected list of strings, got {type(refined_chains)}"
+                    continue
+            except Exception as e:
+                # If last attempt, return detailed error with snippet
+                if attempt == max_retries - 1:
+                    snippet = s[:50] + "..." if len(s) > 50 else s
+                    return None, f"Refine Parse Error: {str(e)} | Content: {snippet}"
+                continue # Retry
+                
+        except requests.exceptions.Timeout:
+            if attempt == max_retries - 1:
+                return None, f"Refine Network Error: Request timed out after {timeout}s"
+            # Retry
+        except Exception as e:
+            if attempt == max_retries - 1:
+                return None, f"Refine Network Error: {str(e)}"
+            # Retry
+            
+    return None, "Refine failed after retries"
 
 import concurrent.futures
 
@@ -236,9 +247,11 @@ def ark_vote_cases(models: List[str], sequence: str, environment: Optional[str],
             total_w = sum(w for _, w in scores)
             avg = sum(s * w for s, w in scores) / (total_w if total_w > 0 else 1.0)
             med = sorted([s for s, _ in scores])[len(scores) // 2]
+            print(f"[Ark Vote] Case {idx+1} Final: Avg={avg:.4f}, Median={med:.4f}")
         else:
             avg = 0.0
             med = 0.0
+            print(f"[Ark Vote] Case {idx+1} Final: No valid votes.")
         per_case.append({"idx": idx, "chains": len(chains), "avg": avg, "med": med, "models": per_model})
 
     best_idx = -1
@@ -250,68 +263,41 @@ def ark_vote_cases(models: List[str], sequence: str, environment: Optional[str],
             best_idx = it["idx"]
     return {"cases": per_case, "best_idx": best_idx, "best_score": best_score}
 
-def ark_extract_constraints(model: str, sequence: str, environment: str, api_key: Optional[str] = None, timeout: int = 120) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def ark_analyze_sequence(sequence: str, api_key: Optional[str] = None) -> str:
     """
-    Extracts physical constraints from the environment description using the LLM.
-    Returns (constraints_list, error_msg).
+    Uses Ark API to annotate the protein sequence.
     """
     url = _ark_endpoint()
     headers = _ark_headers(api_key)
     
     prompt = f"""
-Analyze the protein environment and extract physical constraints.
-Sequence Length: {len(sequence)}
-Environment: "{environment}"
-
-Output a JSON list of constraints using these 4 primitives:
-
-1. "distance_point": Constrain residue(s) to a point (e.g., metal ion).
-   {{ "type": "distance_point", "indices": [i, j...], "distance": float, "strength": float }}
-   *Note: "indices" are 0-based.*
-
-2. "pocket_preservation": Maintain a binding pocket shape around residues.
-   {{ "type": "pocket_preservation", "indices": [i, j...], "radius": float, "strength": float }}
-
-3. "surface_exposure": Force residues to be exposed (e.g., for glycosylation) or buried.
-   {{ "type": "surface_exposure", "indices": [i...], "exposed": bool, "strength": float }}
-
-4. "interface_geometry": Constrain geometry for DNA/RNA/Membrane interaction.
-   {{ "type": "interface_geometry", "indices": [i...], "geometry_type": "planar"|"helical"|"membrane", "params": {{...}}, "strength": float }}
-
-Return ONLY the valid JSON list.
-"""
+    You are an expert bioinformatician. Analyze the following protein sequence:
     
+    Sequence:
+    {sequence}
+    
+    Please provide:
+    1. Potential domain structure.
+    2. Predicted function.
+    3. Active sites or key residues.
+    4. Subcellular localization (e.g. signal peptides).
+    """
+
     payload = {
-        "model": model,
+        "model": "deepseek-v3-2-251201", # Default model for annotation
         "messages": [
-            {"role": "system", "content": "You are a biophysics expert. Extract constraints as JSON."},
+            {"role": "system", "content": "你是人工智能助手."},
             {"role": "user", "content": prompt}
         ]
     }
     
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code != 200:
-            return [], f"HTTP {{r.status_code}}: {{r.text[:100]}}"
-            
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
         data = r.json()
         if "error" in data:
-             return [], f"API Error: {{json.dumps(data['error'])}}"
-             
-        content = (data["choices"][0]["message"]["content"] or "").strip()
-        
-        # Simple parsing to find JSON list
-        start = content.find('[')
-        end = content.rfind(']') + 1
-        if start != -1 and end != -1:
-            json_str = content[start:end]
-            try:
-                constraints = json.loads(json_str)
-                if isinstance(constraints, list):
-                    return constraints, None
-            except:
-                pass
-        return [], "No JSON list found"
-            
+             return f"API Error: {json.dumps(data['error'])}"
+        content = data['choices'][0]['message']['content']
+        return content
     except Exception as e:
-        return [], str(e)
+        return f"LLM Analysis Failed: {e}"
