@@ -72,10 +72,40 @@ python gui.py
 ```bash
 python web_ui/server.py
 ```
-浏览器访问 `http://localhost:9000`（默认端口）。左侧面板可：
+ 浏览器访问 `http://localhost:9000`（默认端口）。左侧面板可：
 - 选择全局运行环境（外部 conda 环境）
 - 勾选 iGPU/NPU，并填写各自环境名
 - 运行后实时查看日志与 3D 预览
+
+## 物理约束与能量项
+MiniFold 的物理评分覆盖主链几何、非键相互作用与环境一致性，核心包括：
+- 主链几何与连续性：理想键长/键角、Ramachandran 合理性、`CA–CA` 连续性（含 `cis` 调整）
+- 氢键网络：`N–H…O` 距离与角度窗口评分（2.9 Å / 160° 为最优区），鼓励二级结构成核
+- 范德华（重原子 LJ）：对骨架重原子 `N/CA/C/O/CB` 全对计算 `σ/ε` 混配的 Lennard–Jones 能量，避免仅用疏水近似
+- 静电：
+  - 侧链近似电荷：基于 `CB–CB` 距离与屏蔽介电的库仑项，含盐桥加权
+  - 骨架库仑：新增 `N–O` 屏蔽库仑相互作用，与氢键项协同但不重复计分
+- 溶剂可接近性代理：以 `CA` 邻居数近似暴露度，鼓励疏水埋藏、限制极性残基过度埋藏
+- 统计势：MJ 接触能（3–10 Å 高斯权重），用于界面与核心打分
+- π 相关作用：阳离子–π 与 π–π（平行/T 型）几何窗口与距离权重
+
+> 权重可在 `modules/igpu_predictor.py` 中调整（如 `w_vdw_heavy`、`w_elec_bb`、`w_hb`、`w_burial` 等），以适配膜蛋白/可溶蛋白或盐浓度等环境。
+
+## 热力学最小化
+- 两阶段优化：
+  - Phase 1（粗折叠）：AdamW 快速收敛到合理构象
+  - Phase 2（精细抛光）：LBFGS 在多能量项下做细致最小化
+- 支持多链装配的刚体参数优化（平移/旋转 6D），与界面能量项联动
+- 可选 OpenMM 短程最小化/微型 MD（如果安装了 `openmm`）
+
+### iGPU 运行提示
+- 后端选择：`--backend auto|directml|ipex|cuda|cpu|oneapi_cpu`
+- 直连运行（当前 Python 环境）：`--igpu`
+- 外部环境运行（隔离）：`--igpu --igpu-env <你的conda环境名>`
+- 可用环境变量：
+  - `MINIFOLD_FAST_MODE=1`：仅启用“疏水塌缩”初始化以加快收敛
+  - `MINIFOLD_IGPU_ADAM_STEPS` / `MINIFOLD_IGPU_LBFGS_MAX_ITER`：调整两阶段步数
+  - `MINIFOLD_IGPU_COMPILE=1`：在支持的设备上启用 `torch.compile`（减少计算开销）
 
 ## NPU 加速说明
 **适配原则**：NPU 擅长固定形状、小型、重复计算密集的全连接/卷积。MiniFold 将 NPU 用于“输出 Head 的固定窗口评分与轻量精炼”，避免进入序列长度动态的 Evoformer/Attention 大模块。
