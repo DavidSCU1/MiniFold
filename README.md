@@ -12,6 +12,11 @@ MiniFold 是一个将生物大模型（LLM）与物理约束优化结合的轻�
   - NPU：承担固定形状、小型、重复计算密集的 Head/输出层评分与精炼。
   - CPU：数据加载、日志、非计算密集的流程。
 - 交互式 Web 界面与桌面 GUI：实时日志与 3D 预览（HTML/3Dmol），支持外部 conda 环境运行。
+- 二级结构分布场：对每个残基输出 `p(H), p(E), p(C)` 的软分布，并在折叠中作为软约束参与（转角区更自然，Gly/Pro 保持高自由度）。
+- 片段一致性评分：基于 3aa 滑窗的 φ/ψ–序列–SS 轻量三元统计，抑制不自然局部扭曲、提升 Ramachandran 通过率。
+- 接触能搜索导向：在折叠早期以疏水塌缩与 MJ 接触能为导向进行“暖启动”（Warmup），使疏水核心更早成核、降低后期硬修。
+- 结构自我审查员：将几何摘要为 token（螺旋长度、β 配对、环长度、埋藏/暴露比），由 LLM 给出 `accept/reject` 与置信分数。
+- 结构置信度叙事：输出 `SS-conf`、`core-stability`、`loop-uncertainty` 等解释性指标，便于设计与突变评估。
 
 ## 安装与环境
 ### 依赖
@@ -106,9 +111,10 @@ MiniFold 的物理评分覆盖主链几何、非键相互作用与环境一致�
   - `MINIFOLD_FAST_MODE=1`：仅启用“疏水塌缩”初始化以加快收敛
   - `MINIFOLD_IGPU_ADAM_STEPS` / `MINIFOLD_IGPU_LBFGS_MAX_ITER`：调整两阶段步数
   - `MINIFOLD_IGPU_COMPILE=1`：在支持的设备上启用 `torch.compile`（减少计算开销）
+  - `MINIFOLD_IGPU_WARMUP_STEPS`：折叠前的暖启动步数（默认 30，强调疏水/MJ/静电导向）
 
 ## NPU 加速说明
-**适配原则**：NPU 擅长固定形状、小型、重复计算密集的全连接/卷积。MiniFold 将 NPU 用于“输出 Head 的固定窗口评分与轻量精炼”，避免进入序列长度动态的 Evoformer/Attention 大模块。
+**适配原则**：NPU 擅长固定形状、小型、重复计算密集的全连接/卷积。MiniFold 将 NPU 用于“输出 Head 的固定窗口评分与精炼”，避免进入序列长度动态的 Evoformer/Attention 大模块。
 - 固定窗口评分由 `modules/npu_runner.py` 进行：
   - 解析生成的 PDB，取 CA 坐标构造固定大小的距离补丁（默认 128×128）
   - 使用小型前馈网络（FP16）计算评分，并写入 PDB 的 `REMARK`：`REMARK NPU_HEAD Applied FixedPatch128 Score x.xxx`
@@ -123,7 +129,9 @@ MiniFold 的物理评分覆盖主链几何、非键相互作用与环境一致�
 3. 主链折叠与装配（iGPU/GPU/CPU），生成 PDB 与 HTML 可视化
 4. NPU 输出 Head 评分（可选，固定窗口），写入 `REMARK`
 5. 可选后处理（OpenMM 简单最小化/微型 MD），更新 PDB
-6. 输出报告与 3D 预览
+6. 结构自我审查：LLM 读几何摘要，返回 `accept/reject` 与分数
+7. 结构置信度叙事：报告中输出 `SS-conf`、`core-stability`、`loop-uncertainty` 等解释性指标
+8. 输出报告与 3D 预览
 
 ## 常见问题
 - `torch-directml` 安装失败

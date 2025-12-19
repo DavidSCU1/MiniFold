@@ -298,6 +298,40 @@ def ss_to_phi_psi_tensor(ss, sequence=None):
 
     return torch.tensor(phi, dtype=torch.float32), torch.tensor(psi, dtype=torch.float32)
 
+def _compute_ss_probs(seq):
+    seq = seq.upper()
+    H = []
+    E = []
+    C = []
+    helix_idx = {c: v for c, v in zip("ACDEFGHIKLMNPQRSTVWY",
+        [1.2,0.8,1.0,0.9,1.1,1.0,0.7,1.1,1.2,1.2,1.2,1.1,0.7,1.0,0.6,0.9,0.9,0.8,1.0,1.2])}
+    sheet_idx = {c: v for c, v in zip("ACDEFGHIKLMNPQRSTVWY",
+        [0.8,0.9,0.9,1.1,1.0,0.9,1.1,0.7,0.8,1.3,1.3,0.8,1.0,1.2,0.6,0.9,0.9,1.3,1.2,1.2])}
+    hydro_idx = {c: v for c, v in zip("ACDEFGHIKLMNPQRSTVWY",
+        [1.8,-4.5,-3.5,-3.5,2.5,-3.5,-3.5,-0.4,-3.2,4.5,3.8,-3.9,1.9,-1.6,-1.6,-0.8,-0.7,-0.9,-1.3,4.2])}
+    for ch in seq:
+        h = helix_idx.get(ch, 0.8)
+        e = sheet_idx.get(ch, 0.8)
+        hp = max(0.0, hydro_idx.get(ch, 0.0))
+        h += hp * 0.1
+        e += 0.0
+        c = max(0.0, 1.0 - (h + e) * 0.3)
+        if ch in ("P", "G"):
+            h *= 0.6
+            e *= 0.8
+            c += 0.3
+        H.append(h)
+        E.append(e)
+        C.append(c)
+    Ht = torch.tensor(H, dtype=torch.float32)
+    Et = torch.tensor(E, dtype=torch.float32)
+    Ct = torch.tensor(C, dtype=torch.float32)
+    S = Ht + Et + Ct + 1e-9
+    pH = Ht / S
+    pE = Et / S
+    pC = Ct / S
+    return torch.stack([pH, pE, pC], dim=1)
+
 def place_atom_tensor(a, b, c, bond_len, bond_angle, dihedral, basis_x=None, basis_y=None):
     bc = c - b
     ab = b - a
@@ -549,10 +583,8 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         if L_seq < L_ss:
             ss = ss[:L_seq]
         p, q = ss_to_phi_psi_tensor(ss, sub_seq)
-        
-        # Create weights: 0.1 for 'C', 1.0 for others
-        w_list = [0.1 if c == 'C' else 1.0 for c in ss]
-        w_tensor = torch.tensor(w_list, dtype=torch.float32, device=device)
+        ss_probs = _compute_ss_probs(sub_seq).to(device)
+        w_tensor = (ss_probs[:,0] + ss_probs[:,1]).clamp(0.0, 1.0)
         
         # Prepare Residue Properties
         hydro_indices = []
@@ -614,6 +646,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             "phi_ref": p.to(device),
             "psi_ref": q.to(device),
             "ss_weights": w_tensor,
+            "ss_probs": ss_probs,
             "hydro_mask": hydro_mask,
             "charge": charge,
             "polar_mask": polar_mask,
@@ -732,12 +765,14 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
 
     cys_indices = torch.nonzero(aa_indices == MJ_INDEX["C"]).flatten()
     
+    opt_phase = "coarse"
     def calc_loss():
         all_N, all_CA, all_C, all_O, all_H, all_CB = [], [], [], [], [], []
         loss_ss = torch.tensor(0.0, device=device)
         loss_rama = torch.tensor(0.0, device=device)
         loss_smooth = torch.tensor(0.0, device=device)
         loss_omega = torch.tensor(0.0, device=device)
+        loss_frag = torch.tensor(0.0, device=device)
         
         # Build
         for i, d in enumerate(chain_data):
@@ -745,12 +780,29 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             psi = psi_params[i]
             omega = omega_params[i]
             
-            # SS Restraint (Adaptive)
+            ss_probs = d.get("ss_probs")
             ss_weights = d.get("ss_weights", torch.ones_like(phi, device=device))
-            
-            d_phi = torch.remainder(phi - d["phi_ref"] + math.pi, 2*math.pi) - math.pi
-            d_psi = torch.remainder(psi - d["psi_ref"] + math.pi, 2*math.pi) - math.pi
-            loss_ss = loss_ss + torch.sum(ss_weights * (d_phi**2 + d_psi**2))
+            h_phi = torch.full_like(phi, math.radians(-60.0))
+            h_psi = torch.full_like(psi, math.radians(-47.0))
+            e_phi = torch.full_like(phi, math.radians(-120.0))
+            e_psi = torch.full_like(psi, math.radians(120.0))
+            d_h = (torch.remainder(phi - h_phi + math.pi, 2*math.pi) - math.pi)**2 + (torch.remainder(psi - h_psi + math.pi, 2*math.pi) - math.pi)**2
+            d_e = (torch.remainder(phi - e_phi + math.pi, 2*math.pi) - math.pi)**2 + (torch.remainder(psi - e_psi + math.pi, 2*math.pi) - math.pi)**2
+            if ss_probs is not None:
+                pH = ss_probs[:,0]
+                pE = ss_probs[:,1]
+                pC = ss_probs[:,2]
+                res_weight = torch.ones_like(pH)
+                res_weight = res_weight + 0.2 * d["hydro_mask"].clamp(0.0, 1.0)
+                res_weight = res_weight - 0.2 * d["polar_mask"].clamp(0.0, 1.0)
+                res_weight = torch.where(d["rama_group_ids"] == 1, res_weight * 0.7, res_weight)
+                res_weight = torch.where(d["rama_group_ids"] == 2, res_weight * 0.7, res_weight)
+                soft_w = res_weight * (pH + pE) * (1.0 - 0.5 * pC)
+                loss_ss = loss_ss + torch.sum(soft_w * (pH * d_h + pE * d_e))
+            else:
+                d_phi = torch.remainder(phi - d["phi_ref"] + math.pi, 2*math.pi) - math.pi
+                d_psi = torch.remainder(psi - d["psi_ref"] + math.pi, 2*math.pi) - math.pi
+                loss_ss = loss_ss + torch.sum(ss_weights * (d_phi**2 + d_psi**2))
             
             group_ids = d.get("rama_group_ids")
             if group_ids is None:
@@ -807,6 +859,14 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             diff_phi = phi[1:] - phi[:-1]
             diff_psi = psi[1:] - psi[:-1]
             loss_smooth = loss_smooth + torch.sum(diff_phi**2 + diff_psi**2)
+            if ss_probs is not None and len(d["seq"]) >= 3:
+                k = 3
+                for j in range(len(d["seq"]) - k + 1):
+                    pH_w = torch.mean(ss_probs[j:j+k,0])
+                    pE_w = torch.mean(ss_probs[j:j+k,1])
+                    seg_h = torch.mean(d_h[j:j+k])
+                    seg_e = torch.mean(d_e[j:j+k])
+                    loss_frag = loss_frag + (pH_w * seg_h + pE_w * seg_e) * 0.5
             
             # Build Structure
             N, CA, C, O, H, CB = build_full_structure_tensor(len(d["seq"]), phi, psi, device, bond_constants, omega=omega)
@@ -876,6 +936,21 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         pair_mask_ca = torch.triu(torch.ones_like(dist_ca_pairs, dtype=torch.bool), diagonal=1) & (idx_diff >= 2)
         ca_pen = torch.relu(3.6 - dist_ca_pairs) ** 2
         loss_ca_hard36 = torch.sum(ca_pen[pair_mask_ca])
+        
+        eps_values = torch.tensor([0.12, 0.10, 0.15, 0.20, 0.18], device=device, dtype=heavy_atoms.dtype)
+        eps_flat = eps_values.repeat(total_residues)
+        sigma_ij = vdW_sum / (2.0 ** (1.0 / 6.0))
+        eps_ij = torch.sqrt(eps_flat.unsqueeze(0) * eps_flat.unsqueeze(1))
+        lj_heavy = 4.0 * eps_ij * ((sigma_ij / (hdist + 1e-6))**12 - (sigma_ij / (hdist + 1e-6))**6)
+        loss_vdw = torch.sum(lj_heavy[pair_mask])
+        
+        diff_no = full_N.unsqueeze(1) - full_O.unsqueeze(0)
+        dist_no = torch.norm(diff_no, dim=2) + 1e-6
+        idx_no = torch.arange(total_residues, device=device)
+        resdiff_no = torch.abs(idx_no.unsqueeze(1) - idx_no.unsqueeze(0))
+        mask_no = (torch.triu(torch.ones_like(dist_no, dtype=torch.bool), diagonal=1) & (resdiff_no >= 2)).float()
+        eps_bb = 10.0 + 70.0 * torch.clamp(dist_no / 12.0, min=0.0, max=1.0)
+        loss_elec_bb = torch.sum(((0.3 * -0.5) / (eps_bb * dist_no)) * mask_no)
         
         # Hydrophobic Effect
         # Optimize CB distance
@@ -1024,22 +1099,36 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         w_catpi = 1.0
         w_pipi = 1.0
         w_lj = 0.5
+        w_vdw_heavy = 0.8
         w_burial = 4.0
         w_polar = 2.0
         w_smooth = 0.0 # User Feedback: "Invisible wire" effect. Disable smooth path.
         w_mj = 4.0 # Boosted: Statistical potential reflects natural selection
         w_disulfide = 5.0 # Strong bias for SS bonds
         w_ca_hard36 = 10.0
+        w_elec_bb = 0.8
         
-        w_hydro_collapse = 2.0
+        w_hydro_collapse = 3.0
         w_charged_clash = 50.0
+        w_frag = 1.0
+        if opt_phase == "warmup":
+            w_ss = 0.5
+            w_rama = 1.5
+            w_hb = 2.0
+            w_hydro = 5.0
+            w_iface_hydro = 4.0
+            w_mj = 6.0
+            w_elec = 2.5
+            w_burial = 3.0
+            w_polar = 0.5
+            w_frag = 0.5
         
         loss = (loss_ss * w_ss + loss_rama * w_rama + loss_omega * w_omega + loss_smooth * w_smooth + loss_rg_target * w_rg_tgt + 
                 clash_loss * w_clash + loss_hard_clash * w_hard_clash + heavy_loss * w_heavy + loss_ca_continuity * w_ca_cont +
                 loss_hydro * w_hydro + loss_iface_hydro * w_iface_hydro + loss_mj * w_mj + 
-                loss_elec * w_elec + loss_catpi * w_catpi + loss_pipi * w_pipi + 
-                loss_lj * w_lj + loss_burial * w_burial + loss_polar * w_polar +
-                hb_energy * w_hb + loss_disulfide * w_disulfide + loss_ca_hard36 * w_ca_hard36 +
+                loss_elec * w_elec + loss_elec_bb * w_elec_bb + loss_catpi * w_catpi + loss_pipi * w_pipi + 
+                loss_lj * w_lj + loss_vdw * w_vdw_heavy + loss_burial * w_burial + loss_polar * w_polar +
+                hb_energy * w_hb + loss_disulfide * w_disulfide + loss_ca_hard36 * w_ca_hard36 + loss_frag * w_frag +
                 loss_hydro_collapse * w_hydro_collapse + loss_charged_clash * w_charged_clash)
         
         # Universal Constraints
@@ -1241,6 +1330,20 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             logger.warning(f"Snapshot failed: {e}")
 
     save_snapshot("init")
+    try:
+        warmup_steps = int(os.environ.get("MINIFOLD_IGPU_WARMUP_STEPS", "30"))
+    except Exception:
+        warmup_steps = 30
+    warmup_steps = max(0, warmup_steps)
+    if warmup_steps > 0:
+        opt_phase = "warmup"
+        opt_warm = torch.optim.AdamW(all_params, lr=0.08, weight_decay=1e-4, foreach=True)
+        for step in range(warmup_steps):
+            opt_warm.zero_grad(set_to_none=True)
+            loss = calc_loss()
+            loss.backward()
+            opt_warm.step()
+        opt_phase = "coarse"
     
     # Bio-Algorithm Initialization Strategy
     # Replaces pure random starts with biologically motivated heuristics.

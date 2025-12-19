@@ -11,6 +11,8 @@ from modules.visualization import generate_html_view
 from modules.env_loader import load_env
 from modules.assembler import parse_pdb_chains, assemble_chains, write_complex_pdb
 from modules.refine import run_refinements, analyze_ubiquitin_core
+from modules.quality import summarize_structure
+from modules.ark_module import ark_audit_structure, get_default_models
 
 def print_progress(percent, step):
     print(f"[PROGRESS] {percent}% - {step}")
@@ -502,6 +504,19 @@ def main():
                         "case": case_idx,
                         "prob": prob
                     })
+                    try:
+                        ss_str = "".join(chains)
+                        summary = summarize_structure(pdb_path, sequence, ss_str)
+                        model = get_default_models()[0]
+                        verdict, score, err = ark_audit_structure(model, summary)
+                        if err:
+                            pass
+                        else:
+                            generated_pdbs[-1]["audit_verdict"] = verdict
+                            generated_pdbs[-1]["audit_score"] = score
+                            generated_pdbs[-1]["summary"] = summary
+                    except Exception:
+                        pass
         else:
             print("No valid SS candidates passed Qwen filter. Using fallback SS to build one model.")
             L = len(sequence)
@@ -675,6 +690,17 @@ def main():
                     "case": 0,
                     "prob": 0.0
                 })
+                try:
+                    ss_str = s
+                    summary = summarize_structure(pdb_path, sequence, ss_str)
+                    model = get_default_models()[0]
+                    verdict, score, err = ark_audit_structure(model, summary)
+                    if not err:
+                        generated_pdbs[-1]["audit_verdict"] = verdict
+                        generated_pdbs[-1]["audit_score"] = score
+                        generated_pdbs[-1]["summary"] = summary
+                except Exception:
+                    pass
         
         # 5. Generate Report
         report_file = os.path.join(workdir, f"{prefix}_report.md")
@@ -698,6 +724,16 @@ def main():
                     f.write(f"- Chains: {m['chains']}\n")
                     f.write(f"- PDB: `{m['pdb']}`\n")
                     f.write(f"- View: [Interactive 3D]({m['html']})\n\n")
+                    if "summary" in m:
+                        s = m["summary"]
+                        f.write(f"- SS-conf: {s.get('ss_conf', 0.0):.2f}\n")
+                        f.write(f"- core-stability: {s.get('core_stability', 0.0):.2f}\n")
+                        f.write(f"- loop-uncertainty: {s.get('loop_uncertainty', 0.0):.2f}\n")
+                        f.write(f"- helix-lengths: {','.join(str(x) for x in s.get('helix_lengths', []))}\n")
+                        f.write(f"- strand-lengths: {','.join(str(x) for x in s.get('strand_lengths', []))}\n")
+                        f.write(f"- loop-lengths: {','.join(str(x) for x in s.get('loop_lengths', []))}\n")
+                    if "audit_verdict" in m:
+                        f.write(f"- Auditor: {m['audit_verdict']} ({m.get('audit_score', 0.0):.2f})\n\n")
             else:
                 f.write("No models generated (PyRosetta missing or no candidates).\n")
 

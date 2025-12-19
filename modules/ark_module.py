@@ -84,6 +84,40 @@ def ark_eval_case(model: str, sequence: str, environment: Optional[str], chains:
     except Exception as e:
         return None, f"Network Error: {str(e)}"
 
+def ark_audit_structure(model: str, summary: Dict[str, Any], api_key: Optional[str] = None, timeout: int = 120) -> Tuple[Optional[str], Optional[float], Optional[str]]:
+    url = _ark_endpoint()
+    headers = _ark_headers(api_key)
+    prompt = {
+        "tokens": summary,
+        "instruction": "Judge naturalness of protein structure. Return JSON: {'verdict': 'accept'|'reject', 'score': 0-1}."
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Return only a short JSON with fields 'verdict' and 'score'."},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}
+        ]
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code != 200:
+            return None, None, f"HTTP {r.status_code}: {r.text[:100]}"
+        data = r.json()
+        if "error" in data:
+            return None, None, f"API Error: {json.dumps(data['error'])}"
+        s = (data["choices"][0]["message"]["content"] or "").strip()
+        try:
+            obj = json.loads(s)
+            verdict = obj.get("verdict")
+            score = obj.get("score")
+            if isinstance(verdict, str) and isinstance(score, (int, float)):
+                return verdict.lower(), float(score), None
+        except Exception:
+            pass
+        return None, None, "Parse Error"
+    except Exception as e:
+        return None, None, f"Network Error: {str(e)}"
+
 def ark_refine_structure(model: str, sequence: str, environment: str, chains: List[str], target_chains: Optional[int] = None, api_key: Optional[str] = None, timeout: int = 300) -> Tuple[Optional[List[str]], Optional[str]]:
     """
     Asks the model to refine the SS structure based on environment description.

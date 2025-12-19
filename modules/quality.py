@@ -1,6 +1,8 @@
 import math
 import json
 import numpy as np
+from typing import Dict, Any, List, Tuple
+from .ss_generator import _compute_propensity_arrays
 
 def rama_pass_rate(phi, psi, seq):
     phi = np.asarray(phi, dtype=float)
@@ -74,3 +76,124 @@ def write_results_json(path, data):
         return True
     except Exception:
         return False
+
+def _parse_pdb_coords(pdb_path: str) -> Tuple[List[int], np.ndarray, np.ndarray]:
+    ca = []
+    cb = []
+    resseq = []
+    with open(pdb_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.startswith("ATOM"):
+                continue
+            name = line[12:16].strip()
+            x = float(line[30:38].strip())
+            y = float(line[38:46].strip())
+            z = float(line[46:54].strip())
+            rid = int(line[22:26].strip())
+            if name == "CA":
+                ca.append([x, y, z])
+                resseq.append(rid)
+            elif name == "CB":
+                cb.append([x, y, z])
+    CA = np.asarray(ca, dtype=float)
+    CB = np.asarray(cb, dtype=float)
+    return resseq, CA, CB
+
+def _exposure_array(CA: np.ndarray) -> np.ndarray:
+    if len(CA) == 0:
+        return np.zeros((0,), dtype=float)
+    diff = CA[np.newaxis, :, :] - CA[:, np.newaxis, :]
+    dist = np.linalg.norm(diff, axis=2) + 1e-6
+    idx = np.arange(len(CA))
+    mask = (np.abs(idx[np.newaxis, :] - idx[:, np.newaxis]) > 2) & (dist < 8.0)
+    counts = np.sum(mask, axis=1)
+    exp = 1.0 / (1.0 + counts.astype(float))
+    return exp
+
+def ss_conf(sequence: str, ss_str: str) -> float:
+    H, E, C = _compute_propensity_arrays(sequence)
+    n = len(sequence)
+    s = 0.0
+    for i in range(n):
+        h = H[i]
+        e = E[i]
+        c = C[i]
+        tot = h + e + c + 1e-9
+        ph = h / tot
+        pe = e / tot
+        pc = c / tot
+        lab = ss_str[i] if i < len(ss_str) else "C"
+        if lab == "H":
+            s += ph
+        elif lab == "E":
+            s += pe
+        else:
+            s += pc
+    return float(s / max(n, 1))
+
+def summarize_structure(pdb_path: str, sequence: str, ss_str: str) -> Dict[str, Any]:
+    resseq, CA, CB = _parse_pdb_coords(pdb_path)
+    exp = _exposure_array(CA)
+    hyd_set = set(['I','L','V','F','M','A'])
+    polar_set = set(['D','E','K','R','H','N','Q','S','T','Y','C','W'])
+    hyd_buried = 0
+    hyd_total = 0
+    polar_buried = 0
+    polar_total = 0
+    for i, aa in enumerate(sequence):
+        if i >= len(exp):
+            break
+        if aa in hyd_set:
+            hyd_total += 1
+            if exp[i] < 0.5:
+                hyd_buried += 1
+        elif aa in polar_set:
+            polar_total += 1
+            if exp[i] < 0.5:
+                polar_buried += 1
+    core_stability = float(hyd_buried / max(hyd_total, 1))
+    loop_uncertainty = float(sum(1 for i,c in enumerate(ss_str) if c == "C" and (i < len(exp) and exp[i] < 0.3)) / max(sum(1 for c in ss_str if c == "C"), 1))
+    hl = []
+    el = []
+    cl = []
+    cur = None
+    cnt = 0
+    for c in ss_str:
+        if cur is None:
+            cur = c
+            cnt = 1
+        elif c == cur:
+            cnt += 1
+        else:
+            if cur == "H":
+                hl.append(cnt)
+            elif cur == "E":
+                el.append(cnt)
+            else:
+                cl.append(cnt)
+            cur = c
+            cnt = 1
+    if cur is not None:
+        if cur == "H":
+            hl.append(cnt)
+        elif cur == "E":
+            el.append(cnt)
+        else:
+            cl.append(cnt)
+    mj = None
+    try:
+        aa_order = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','S','T','W','Y','V']
+        mj_matrix = np.zeros((20,20), dtype=float)
+        mj = contact_energy(CA, CB if len(CB)==len(CA) else CA, sequence, mj_matrix)
+    except Exception:
+        mj = 0.0
+    return {
+        "helix_lengths": hl,
+        "strand_lengths": el,
+        "loop_lengths": cl,
+        "buried_exposed_ratio": float(np.mean(exp)) if len(exp)>0 else 0.0,
+        "core_stability": core_stability,
+        "loop_uncertainty": loop_uncertainty,
+        "ss_conf": ss_conf(sequence, ss_str),
+        "mj_contact_energy": mj
+    }
