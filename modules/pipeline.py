@@ -8,11 +8,9 @@ from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
 from modules.ark_module import ark_vote_cases, get_default_models, ark_refine_structure, ark_analyze_sequence
 from modules.backbone_predictor import run_backbone_fold_multichain
-from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
-from modules.igpu_predictor import check_gpu_availability
 from modules.visualization import generate_html_view
 
-def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name, target_chains=None, log_callback=print):
+def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name, target_chains=None, backend="auto", log_callback=print, use_npu=False, use_npu_ext_env=False, npu_ext_env_name=None):
     """
     Core MiniFold pipeline execution logic.
     
@@ -26,6 +24,7 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
         use_ext_env: Whether to use external environment
         ext_env_name: Name/path of external environment
         target_chains: Enforce specific number of chains (optional)
+        backend: Acceleration backend ("auto", "ipex", "directml", "cuda", "cpu")
         log_callback: Function to handle log messages (default: print)
     """
     try:
@@ -58,8 +57,7 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
         with open(req_path, "r", encoding="utf-8") as f:
             req_text = f.read()
 
-        gpu_ok, gpu_name, gpu_type = check_gpu_availability()
-        auto_igpu = bool(use_igpu or gpu_ok or (use_ext_env and ext_env_name))
+        auto_igpu = bool(use_igpu or (use_ext_env and ext_env_name))
         for seq_id, sequence in sequences:
             log_callback(f"处理序列: {seq_id} (长度 {len(sequence)})")
             q_result = pybiomed_ss_candidates(sequence, env_text, num=ssn, target_chains=target_chains)
@@ -274,11 +272,17 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                             if os.path.sep in ext_env_name or "/" in ext_env_name:
                                 # Path to python executable
                                 cmd_list = [ext_env_name, runner_script, "--input", tmp_input, "--output", pdb_path]
+                                if backend and backend != "auto":
+                                    cmd_list.extend(["--backend", backend])
                                 cmd_str = subprocess.list2cmdline(cmd_list)
                             else:
                                 # Conda env name
                                 cmd_list = ["conda", "run", "-n", ext_env_name, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
-                                cmd_str = f'conda run -n {ext_env_name} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                                if backend and backend != "auto":
+                                    cmd_list.extend(["--backend", backend])
+                                # For cmd_str reconstruction manually (be careful with quotes)
+                                backend_arg = f' --backend {backend}' if backend and backend != "auto" else ''
+                                cmd_str = f'conda run -n {ext_env_name} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"{backend_arg}'
                             
                             try:
                                 # Use shell=True for conda on Windows
@@ -307,13 +311,37 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                                 try: os.remove(tmp_input) 
                                 except: pass
                         else:
-                            log_callback(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU)...")
-                            success = run_igpu_fold(sequence, chains, pdb_path)
+                            log_callback(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU, backend={backend})...")
+                            from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
+                            success = run_igpu_fold(sequence, chains, pdb_path, constraints=constraints, backend=backend)
                     else:
                         log_callback(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (Standard)...")
                         success = run_backbone_fold_multichain(sequence, chains, pdb_path)
 
                     if success:
+                        if use_npu:
+                            try:
+                                runner_script = os.path.join(os.getcwd(), "modules", "npu_runner.py")
+                                if use_npu_ext_env and npu_ext_env_name:
+                                    if os.path.sep in npu_ext_env_name or "/" in npu_ext_env_name:
+                                        cmd_list = [npu_ext_env_name, runner_script, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str = subprocess.list2cmdline(cmd_list)
+                                    else:
+                                        cmd_list = ["conda", "run", "-n", npu_ext_env_name, "python", runner_script, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str = f'conda run -n {npu_ext_env_name} python "{runner_script}" --input "{pdb_path}" --output "{pdb_path}"'
+                                    result = subprocess.run(cmd_str if os.name == "nt" else cmd_list, capture_output=True, text=True, encoding="utf-8", shell=(os.name=="nt"))
+                                    if result.stdout:
+                                        log_callback(f"[NPU Output] {result.stdout.strip()}")
+                                    if result.stderr:
+                                        log_callback(f"[NPU Error] {result.stderr.strip()}")
+                                else:
+                                    try:
+                                        import modules.npu_runner as _nr
+                                        _nr.run_inplace(pdb_path)
+                                    except Exception as e:
+                                        log_callback(f"[NPU Inline Error] {e}")
+                            except Exception as e:
+                                log_callback(f"[NPU Runner Error] {e}")
                         html_name = f"{prefix}_{suffix}.html"
                         html_path = os.path.join(three_d_dir, html_name)
                         generate_html_view(pdb_path, html_path)
@@ -375,6 +403,7 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                             except: pass
                     else:
                         log_callback(f"  > Fallback: Optimizing backbone (iGPU)...")
+                        from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
                         success = run_igpu_fold(sequence, [s], pdb_path, constraints=constraints)
                     if not success:
                         log_callback("  > Fallback: iGPU path failed, trying Standard optimizer...")
@@ -384,6 +413,29 @@ def run_pipeline(fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env,
                     success = run_backbone_fold_multichain(sequence, [s], pdb_path)
                 
                 if success:
+                    if use_npu:
+                        try:
+                            runner_script = os.path.join(os.getcwd(), "modules", "npu_runner.py")
+                            if use_npu_ext_env and npu_ext_env_name:
+                                if os.path.sep in npu_ext_env_name or "/" in npu_ext_env_name:
+                                    cmd_list = [npu_ext_env_name, runner_script, "--input", pdb_path, "--output", pdb_path]
+                                    cmd_str = subprocess.list2cmdline(cmd_list)
+                                else:
+                                    cmd_list = ["conda", "run", "-n", npu_ext_env_name, "python", runner_script, "--input", pdb_path, "--output", pdb_path]
+                                    cmd_str = f'conda run -n {npu_ext_env_name} python "{runner_script}" --input "{pdb_path}" --output "{pdb_path}"'
+                                result = subprocess.run(cmd_str if os.name == "nt" else cmd_list, capture_output=True, text=True, encoding="utf-8", shell=(os.name=="nt"))
+                                if result.stdout:
+                                    log_callback(f"[NPU Output] {result.stdout.strip()}")
+                                if result.stderr:
+                                    log_callback(f"[NPU Error] {result.stderr.strip()}")
+                            else:
+                                try:
+                                    import modules.npu_runner as _nr
+                                    _nr.run_inplace(pdb_path)
+                                except Exception as e:
+                                    log_callback(f"[NPU Inline Error] {e}")
+                        except Exception as e:
+                            log_callback(f"[NPU Runner Error] {e}")
                     html_name = f"{prefix}_{suffix}.html"
                     html_path = os.path.join(three_d_dir, html_name)
                     generate_html_view(pdb_path, html_path)

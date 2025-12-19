@@ -7,10 +7,10 @@ from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
 from modules.ark_module import ark_vote_cases, ark_analyze_sequence, get_default_models, ark_refine_structure
 from modules.backbone_predictor import run_backbone_fold_multichain
-from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
 from modules.env_loader import load_env
 from modules.assembler import parse_pdb_chains, assemble_chains, write_complex_pdb
+from modules.refine import run_refinements, analyze_ubiquitin_core
 
 def print_progress(percent, step):
     print(f"[PROGRESS] {percent}% - {step}")
@@ -25,7 +25,15 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5, help="Likelihood threshold for Qwen filter")
     parser.add_argument("--igpu", action="store_true", help="Enable iGPU acceleration")
     parser.add_argument("--igpu-env", default=None, help="Conda environment for iGPU execution")
+    parser.add_argument("--backend", default="auto", choices=["auto", "ipex", "directml", "cuda", "cpu", "oneapi_cpu"], help="Acceleration backend")
+    parser.add_argument("--npu", action="store_true", help="Enable NPU head refinement")
+    parser.add_argument("--npu-env", default=None, help="Conda environment for NPU execution")
     parser.add_argument("--target-chains", type=int, default=None, help="Enforce specific number of chains (e.g. 1, 2)")
+    parser.add_argument("--refine-ramachandran", action="store_true", help="Adjust backbone dihedrals via local torsion smoothing")
+    parser.add_argument("--refine-hydrophobic", action="store_true", help="Analyze and nudge hydrophobic core packing")
+    parser.add_argument("--repack-long-sides", action="store_true", help="Repack long sidechains (Lys/Gln/Glu)")
+    parser.add_argument("--md", default=None, choices=[None, "openmm", "amber", "gromacs"], help="Short MD/minimization engine")
+    parser.add_argument("--md-steps", type=int, default=0, help="MD steps for refinement (OpenMM recommended)")
     
     args = parser.parse_args()
     
@@ -346,60 +354,103 @@ def main():
                         if os.sep in args.igpu_env or "/" in args.igpu_env:
                             # Path to python
                             cmd_list = [args.igpu_env, runner_script, "--input", tmp_input, "--output", pdb_path]
+                            if args.backend and args.backend != "auto":
+                                cmd_list.extend(["--backend", args.backend])
                             cmd_str = subprocess.list2cmdline(cmd_list)
                         else:
                             # Conda env name
                             if sys.platform == "win32":
-                                cmd_str = f'cmd /c conda run -n {args.igpu_env} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                                backend_arg = f' --backend {args.backend}' if args.backend and args.backend != "auto" else ''
+                                cmd_str = f'cmd /c conda run -n {args.igpu_env} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"{backend_arg}'
                                 cmd_list = cmd_str # For shell=True/False consideration, win usually needs string for cmd /c
                             else:
                                 cmd_list = ["conda", "run", "-n", args.igpu_env, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
+                                if args.backend and args.backend != "auto":
+                                    cmd_list.extend(["--backend", args.backend])
                                 cmd_str = " ".join(cmd_list)
 
                         try:
-                            # Execute
                             import subprocess
                             use_shell = (sys.platform == "win32")
-                            
-                            # Setup environment variables to force UTF-8 for subprocess
                             env_vars = os.environ.copy()
                             env_vars["PYTHONIOENCODING"] = "utf-8"
                             env_vars["PYTHONUTF8"] = "1"
-                            
                             result = subprocess.run(
                                 cmd_str if sys.platform == "win32" else cmd_list,
                                 capture_output=True,
                                 text=True,
                                 encoding="utf-8",
-                                errors='replace', # Ignore decode errors
+                                errors='replace',
                                 shell=use_shell,
                                 env=env_vars
                             )
-                            
                             if result.stdout: print(f"[iGPU Output] {result.stdout.strip()}")
                             if result.stderr: print(f"[iGPU Error] {result.stderr.strip()}")
-                            
                             if result.returncode == 0:
                                 success = True
                             else:
                                 print(f"    iGPU External Failed (RC={result.returncode})")
                         except Exception as e:
                             print(f"    Execution Error: {e}")
-                        
                         if os.path.exists(tmp_input):
-                            try: os.remove(tmp_input) 
+                            try: os.remove(tmp_input)
                             except: pass
                     else:
                         print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU)...")
-                        success = run_igpu_fold(sequence, chains, pdb_path)
+                        from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
+                        success = run_igpu_fold(sequence, chains, pdb_path, backend=args.backend)
                 else:
                     print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (Standard)...")
                     success = run_backbone_fold_multichain(sequence, chains, pdb_path)
                 
                 if success:
+                    if args.npu:
+                        try:
+                            runner_script_npu = os.path.join(os.getcwd(), "modules", "npu_runner.py")
+                            if args.npu_env:
+                                if os.sep in args.npu_env or "/" in args.npu_env:
+                                    cmd_list_npu = [args.npu_env, runner_script_npu, "--input", pdb_path, "--output", pdb_path]
+                                    cmd_str_npu = subprocess.list2cmdline(cmd_list_npu)
+                                else:
+                                    if sys.platform == "win32":
+                                        cmd_str_npu = f'cmd /c conda run -n {args.npu_env} python "{runner_script_npu}" --input "{pdb_path}" --output "{pdb_path}"'
+                                        cmd_list_npu = cmd_str_npu
+                                    else:
+                                        cmd_list_npu = ["conda", "run", "-n", args.npu_env, "python", runner_script_npu, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str_npu = " ".join(cmd_list_npu)
+                                use_shell_npu = (sys.platform == "win32")
+                                res_npu = subprocess.run(
+                                    cmd_str_npu if sys.platform == "win32" else cmd_list_npu,
+                                    capture_output=True,
+                                    text=True,
+                                    encoding="utf-8",
+                                    shell=use_shell_npu
+                                )
+                                if res_npu.stdout:
+                                    print(f"[NPU Output] {res_npu.stdout.strip()}")
+                                if res_npu.stderr:
+                                    print(f"[NPU Error] {res_npu.stderr.strip()}")
+                            else:
+                                try:
+                                    import modules.npu_runner as _nr
+                                    _nr.run_inplace(pdb_path)
+                                except Exception as e:
+                                    print(f"[NPU Inline Error] {e}")
+                        except Exception as e:
+                            print(f"[NPU Runner Error] {e}")
                     # Refinement Step (Automatic Assembly & Sidechain Packing)
                     print(f"  > Refinement: Optimizing sidechains and assembly for {pdb_name}...")
                     try:
+                        remark_lines = []
+                        try:
+                            with open(pdb_path, "r", encoding="utf-8", errors="replace") as f:
+                                for line in f:
+                                    if line.startswith("REMARK"):
+                                        remark_lines.append(line.rstrip("\r\n"))
+                                    elif line.startswith("ATOM") or line.startswith("HETATM"):
+                                        break
+                        except Exception:
+                            remark_lines = []
                         chains_data = parse_pdb_chains(pdb_path)
                         if chains_data:
                             # 1. Assembly (Docking) if needed
@@ -413,11 +464,27 @@ def main():
                             refined_pdb_name = f"{prefix}_{suffix}_refined.pdb"
                             refined_pdb_path = os.path.join(three_d_dir, refined_pdb_name)
                             
-                            if write_complex_pdb(assembled_chains, sequence, refined_pdb_path):
+                            if write_complex_pdb(assembled_chains, sequence, refined_pdb_path, remark_lines=remark_lines):
                                 print(f"  > Refinement complete. Saved to {refined_pdb_name}")
                                 # Use refined model for final output
                                 pdb_path = refined_pdb_path
                                 pdb_name = refined_pdb_name
+                                try:
+                                    run_refinements(
+                                        pdb_path,
+                                        sequence,
+                                        do_ramachandran=args.refine_ramachandran,
+                                        do_hydrophobic=args.refine_hydrophobic,
+                                        repack_long=args.repack_long_sides,
+                                        md_engine=args.md,
+                                        md_steps=args.md_steps
+                                    )
+                                    core_info = analyze_ubiquitin_core(pdb_path, sequence)
+                                    if core_info and core_info.get("pair"):
+                                        d = core_info["pair"]["distance"]
+                                        print(f"  > Ubiquitin Ile44–Val70 distance: {d:.2f} Å")
+                                except Exception as _e:
+                                    print(f"  > Post-refinement step skipped: {_e}")
                             else:
                                 print("  > Refinement failed to write. Using raw backbone.")
                         else:
@@ -425,7 +492,7 @@ def main():
                     except Exception as e:
                         print(f"  > Refinement error: {e}")
 
-                    html_name = f"{prefix}_{suffix}.html"
+                    html_name = os.path.splitext(pdb_name)[0] + ".html"
                     html_path = os.path.join(three_d_dir, html_name)
                     generate_html_view(pdb_path, html_path)
                     generated_pdbs.append({
@@ -463,13 +530,18 @@ def main():
                     
                     if os.sep in args.igpu_env or "/" in args.igpu_env:
                         cmd_list = [args.igpu_env, runner_script, "--input", tmp_input, "--output", pdb_path]
+                        if args.backend and args.backend != "auto":
+                            cmd_list.extend(["--backend", args.backend])
                         cmd_str = subprocess.list2cmdline(cmd_list)
                     else:
                         if sys.platform == "win32":
-                            cmd_str = f'cmd /c conda run -n {args.igpu_env} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"'
+                            backend_arg = f' --backend {args.backend}' if args.backend and args.backend != "auto" else ''
+                            cmd_str = f'cmd /c conda run -n {args.igpu_env} python "{runner_script}" --input "{tmp_input}" --output "{pdb_path}"{backend_arg}'
                             cmd_list = cmd_str
                         else:
                             cmd_list = ["conda", "run", "-n", args.igpu_env, "python", runner_script, "--input", tmp_input, "--output", pdb_path]
+                            if args.backend and args.backend != "auto":
+                                cmd_list.extend(["--backend", args.backend])
                             cmd_str = " ".join(cmd_list)
 
                     try:
@@ -497,15 +569,64 @@ def main():
                         try: os.remove(tmp_input) 
                         except: pass
                 else:
-                    success = run_igpu_fold(sequence, [s], pdb_path)
+                    from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
+                    success = run_igpu_fold(sequence, [s], pdb_path, backend=args.backend)
             else:
                 success = run_backbone_fold_multichain(sequence, [s], pdb_path)
                 
-            if success:
+                if success:
+                    if args.npu:
+                        try:
+                            runner_script_npu = os.path.join(os.getcwd(), "modules", "npu_runner.py")
+                            if args.npu_env:
+                                if os.sep in args.npu_env or "/" in args.npu_env:
+                                    cmd_list_npu = [args.npu_env, runner_script_npu, "--input", pdb_path, "--output", pdb_path]
+                                    cmd_str_npu = subprocess.list2cmdline(cmd_list_npu)
+                                else:
+                                    if sys.platform == "win32":
+                                        cmd_str_npu = f'cmd /c conda run -n {args.npu_env} python "{runner_script_npu}" --input "{pdb_path}" --output "{pdb_path}"'
+                                        cmd_list_npu = cmd_str_npu
+                                    else:
+                                        cmd_list_npu = ["conda", "run", "-n", args.npu_env, "python", runner_script_npu, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str_npu = " ".join(cmd_list_npu)
+                                use_shell_npu = (sys.platform == "win32")
+                                env_vars_npu = os.environ.copy()
+                                env_vars_npu["PYTHONIOENCODING"] = "utf-8"
+                                env_vars_npu["PYTHONUTF8"] = "1"
+                                res_npu = subprocess.run(
+                                    cmd_str_npu if sys.platform == "win32" else cmd_list_npu,
+                                    capture_output=True,
+                                    text=True,
+                                    encoding="utf-8",
+                                    shell=use_shell_npu,
+                                    env=env_vars_npu
+                                )
+                                if res_npu.stdout:
+                                    print(f"[NPU Output] {res_npu.stdout.strip()}")
+                                if res_npu.stderr:
+                                    print(f"[NPU Error] {res_npu.stderr.strip()}")
+                            else:
+                                try:
+                                    import modules.npu_runner as _nr
+                                    _nr.run_inplace(pdb_path)
+                                except Exception as e:
+                                    print(f"[NPU Inline Error] {e}")
+                        except Exception as e:
+                            print(f"[NPU Runner Error] {e}")
                 # Refinement Step (Automatic Assembly & Sidechain Packing)
                 # For fallback model, it might be single chain, but still useful to refine sidechains.
                 print(f"  > Refinement: Optimizing sidechains and assembly for {pdb_name}...")
                 try:
+                    remark_lines = []
+                    try:
+                        with open(pdb_path, "r", encoding="utf-8", errors="replace") as f:
+                            for line in f:
+                                if line.startswith("REMARK"):
+                                    remark_lines.append(line.rstrip("\r\n"))
+                                elif line.startswith("ATOM") or line.startswith("HETATM"):
+                                    break
+                    except Exception:
+                        remark_lines = []
                     chains_data = parse_pdb_chains(pdb_path)
                     if chains_data:
                         if len(chains_data) > 1:
@@ -516,11 +637,27 @@ def main():
                         refined_pdb_name = f"{prefix}_{suffix}_refined.pdb"
                         refined_pdb_path = os.path.join(three_d_dir, refined_pdb_name)
                         
-                        if write_complex_pdb(assembled_chains, sequence, refined_pdb_path):
+                        if write_complex_pdb(assembled_chains, sequence, refined_pdb_path, remark_lines=remark_lines):
                             print(f"  > Refinement complete. Saved to {refined_pdb_name}")
                             # Update pdb_path and pdb_name to point to the refined model
                             pdb_path = refined_pdb_path
                             pdb_name = refined_pdb_name
+                            try:
+                                run_refinements(
+                                    pdb_path,
+                                    sequence,
+                                    do_ramachandran=args.refine_ramachandran,
+                                    do_hydrophobic=args.refine_hydrophobic,
+                                    repack_long=args.repack_long_sides,
+                                    md_engine=args.md,
+                                    md_steps=args.md_steps
+                                )
+                                core_info = analyze_ubiquitin_core(pdb_path, sequence)
+                                if core_info and core_info.get("pair"):
+                                    d = core_info["pair"]["distance"]
+                                    print(f"  > Ubiquitin Ile44–Val70 distance: {d:.2f} Å")
+                            except Exception as _e:
+                                print(f"  > Post-refinement step skipped: {_e}")
                         else:
                             print("  > Refinement failed to write. Using raw backbone.")
                     else:
@@ -528,7 +665,7 @@ def main():
                 except Exception as e:
                     print(f"  > Refinement error: {e}")
 
-                html_name = f"{prefix}_{suffix}.html"
+                html_name = os.path.splitext(pdb_name)[0] + ".html"
                 html_path = os.path.join(three_d_dir, html_name)
                 generate_html_view(pdb_path, html_path)
                 generated_pdbs.append({

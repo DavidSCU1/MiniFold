@@ -11,7 +11,6 @@ from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
 from modules.ark_module import ark_vote_cases, ark_analyze_sequence, get_default_models
 from modules.backbone_predictor import run_backbone_fold_multichain
-from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
 from modules.visualization import generate_html_view
 
 
@@ -106,21 +105,32 @@ class MiniFoldGUI:
         # iGPU Acceleration
         self.igpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(params, text="🚀 启用 iGPU 加速", variable=self.igpu_var).grid(row=0, column=4, sticky="w", padx=12)
+        # NPU Acceleration
+        self.npu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(params, text="⚡ 启用 NPU 加速", variable=self.npu_var).grid(row=0, column=5, sticky="w", padx=12)
 
         # External Environment (for iGPU)
         ext_frame = ttk.Frame(form)
         ext_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(4, 4))
         
         self.use_ext_env_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ext_frame, text="使用独立环境 (推荐)", variable=self.use_ext_env_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(ext_frame, text="iGPU 使用独立环境", variable=self.use_ext_env_var).pack(side=tk.LEFT)
         
         ttk.Label(ext_frame, text="环境名称/路径:").pack(side=tk.LEFT, padx=(8, 4))
         self.ext_env_name_var = tk.StringVar(value="MiniFold_NPU")
         ttk.Entry(ext_frame, textvariable=self.ext_env_name_var, width=30).pack(side=tk.LEFT)
 
+        npu_frame = ttk.Frame(form)
+        npu_frame.grid(row=8, column=0, columnspan=2, sticky="we", pady=(4, 4))
+        self.use_npu_ext_env_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(npu_frame, text="NPU 使用独立环境", variable=self.use_npu_ext_env_var).pack(side=tk.LEFT)
+        ttk.Label(npu_frame, text="环境名称/路径:").pack(side=tk.LEFT, padx=(8, 4))
+        self.npu_ext_env_name_var = tk.StringVar(value="MiniFold_NPU")
+        ttk.Entry(npu_frame, textvariable=self.npu_ext_env_name_var, width=30).pack(side=tk.LEFT)
+
         # UI scaling for clarity
         scale_frame = ttk.Frame(form)
-        scale_frame.grid(row=8, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        scale_frame.grid(row=9, column=0, columnspan=2, sticky="we", pady=(4, 0))
         ttk.Label(scale_frame, text="界面缩放").grid(row=0, column=0, sticky="w")
         self.scale_label = ttk.Label(scale_frame, text="100%")
         self.scale_label.grid(row=0, column=2, sticky="e")
@@ -241,8 +251,11 @@ class MiniFoldGUI:
         ssn = self.ssn_var.get()
         threshold = self.threshold_var.get()
         use_igpu = self.igpu_var.get()
+        use_npu = self.npu_var.get()
         use_ext_env = self.use_ext_env_var.get()
         ext_env_name = self.ext_env_name_var.get().strip()
+        use_npu_ext_env = self.use_npu_ext_env_var.get()
+        npu_ext_env_name = self.npu_ext_env_name_var.get().strip()
 
         if not fasta:
             messagebox.showwarning("提示", "请先选择 FASTA 文件。")
@@ -264,13 +277,13 @@ class MiniFoldGUI:
         self.log("==== 开始运行 MiniFold 工作流 ====")
         t = threading.Thread(
             target=self._run_pipeline,
-            args=(fasta, outdir, self.env_var.get().strip(), ssn, threshold, use_igpu, use_ext_env, ext_env_name),
+            args=(fasta, outdir, self.env_var.get().strip(), ssn, threshold, use_igpu, use_ext_env, ext_env_name, use_npu, use_npu_ext_env, npu_ext_env_name),
             daemon=True,
         )
         t.start()
 
     # Core workflow (adapted from minifold.py)
-    def _run_pipeline(self, fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name):
+    def _run_pipeline(self, fasta, outdir, env_text, ssn, threshold, use_igpu, use_ext_env, ext_env_name, use_npu, use_npu_ext_env, npu_ext_env_name):
         try:
             load_env()
             os.makedirs(outdir, exist_ok=True)
@@ -439,12 +452,36 @@ class MiniFoldGUI:
                                 except: pass
                         else:
                             self.log(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU)...")
+                            from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
                             success = run_igpu_fold(sequence, chains, pdb_path)
                     else:
                         self.log(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (Standard)...")
                         success = run_backbone_fold_multichain(sequence, chains, pdb_path)
 
                     if success:
+                        if use_npu:
+                            try:
+                                runner_script = os.path.join(os.getcwd(), "modules", "npu_runner.py")
+                                if use_npu_ext_env and npu_ext_env_name:
+                                    if os.path.sep in npu_ext_env_name or "/" in npu_ext_env_name:
+                                        cmd_list = [npu_ext_env_name, runner_script, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str = subprocess.list2cmdline(cmd_list)
+                                    else:
+                                        cmd_list = ["conda", "run", "-n", npu_ext_env_name, "python", runner_script, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str = f'conda run -n {npu_ext_env_name} python "{runner_script}" --input "{pdb_path}" --output "{pdb_path}"'
+                                    result = subprocess.run(cmd_str if os.name == "nt" else cmd_list, capture_output=True, text=True, encoding="utf-8", shell=(os.name=="nt"))
+                                    if result.stdout:
+                                        self.log(f"[NPU Output] {result.stdout.strip()}")
+                                    if result.stderr:
+                                        self.log(f"[NPU Error] {result.stderr.strip()}")
+                                else:
+                                    try:
+                                        import modules.npu_runner as _nr
+                                        _nr.run_inplace(pdb_path)
+                                    except Exception as e:
+                                        self.log(f"[NPU Inline Error] {e}")
+                            except Exception as e:
+                                self.log(f"[NPU Runner Error] {e}")
                         html_name = f"{prefix}_{suffix}.html"
                         html_path = os.path.join(three_d_dir, html_name)
                         generate_html_view(pdb_path, html_path)
@@ -502,11 +539,35 @@ class MiniFoldGUI:
                                 try: os.remove(tmp_input) 
                                 except: pass
                         else:
+                            from modules.igpu_predictor import run_backbone_fold_multichain as run_igpu_fold
                             success = run_igpu_fold(sequence, [s], pdb_path)
                     else:
                         success = run_backbone_fold_multichain(sequence, [s], pdb_path)
 
                     if success:
+                        if use_npu:
+                            try:
+                                runner_script = os.path.join(os.getcwd(), "modules", "npu_runner.py")
+                                if use_npu_ext_env and npu_ext_env_name:
+                                    if os.path.sep in npu_ext_env_name or "/" in npu_ext_env_name:
+                                        cmd_list = [npu_ext_env_name, runner_script, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str = subprocess.list2cmdline(cmd_list)
+                                    else:
+                                        cmd_list = ["conda", "run", "-n", npu_ext_env_name, "python", runner_script, "--input", pdb_path, "--output", pdb_path]
+                                        cmd_str = f'conda run -n {npu_ext_env_name} python "{runner_script}" --input "{pdb_path}" --output "{pdb_path}"'
+                                    result = subprocess.run(cmd_str if os.name == "nt" else cmd_list, capture_output=True, text=True, encoding="utf-8", shell=(os.name=="nt"))
+                                    if result.stdout:
+                                        self.log(f"[NPU Output] {result.stdout.strip()}")
+                                    if result.stderr:
+                                        self.log(f"[NPU Error] {result.stderr.strip()}")
+                                else:
+                                    try:
+                                        import modules.npu_runner as _nr
+                                        _nr.run_inplace(pdb_path)
+                                    except Exception as e:
+                                        self.log(f"[NPU Inline Error] {e}")
+                            except Exception as e:
+                                self.log(f"[NPU Runner Error] {e}")
                         html_name = f"{prefix}_{suffix}.html"
                         html_path = os.path.join(three_d_dir, html_name)
                         generate_html_view(pdb_path, html_path)

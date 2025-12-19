@@ -4,15 +4,69 @@ import platform
 import time
 import numpy as np
 import torch
-import cpuinfo
+try:
+    import cpuinfo
+except Exception:
+    cpuinfo = None
 import os
 import shutil
+import warnings
+import subprocess
+# Suppress DirectML lerp warning which falls back to CPU (performance warning, not fatal)
+warnings.filterwarnings("ignore", message=".*aten::lerp.*")
+
 from modules.quality import rama_pass_rate, contact_energy, tm_score_proxy, write_results_json
+from modules.env_loader import load_env
 try:
     import torch_directml
     _HAS_DML = True
 except Exception:
     _HAS_DML = False
+
+_IPEX = None
+
+def _load_ipex():
+    global _IPEX
+    if _IPEX is not None:
+        return _IPEX, None
+    try:
+        def _bootstrap_oneapi_env_local():
+            try:
+                load_env()
+            except Exception:
+                pass
+            try:
+                root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                load_env(os.path.join(root, ".env.oneapi"))
+            except Exception:
+                pass
+            vs = os.environ.get("VS2022INSTALLDIR")
+            setvars = os.environ.get("ONEAPI_SETVARS")
+            if not setvars or not os.path.exists(setvars):
+                return
+            parts = []
+            if vs:
+                parts.append(f'set "VS2022INSTALLDIR={vs}"')
+            args_val = os.environ.get("ONEAPI_SETVARS_ARGS", "--force")
+            parts.append(f'call "{setvars}" {args_val}')
+            parts.append('set')
+            cmd = 'cmd /c ' + ' && '.join(parts)
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode == 0 and r.stdout:
+                    for line in r.stdout.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            os.environ[k] = v
+            except Exception:
+                pass
+        _bootstrap_oneapi_env_local()
+        import intel_extension_for_pytorch as ipex
+        _IPEX = ipex
+        return _IPEX, None
+    except (Exception, SystemExit, OSError) as e:
+        return None, e
+
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -21,7 +75,7 @@ ALGO_VERSION = "igpu_dml_v2.4_phys_mj_pi"
 # Precompute bond parameters (PyTorch tensors)
 # Engh & Huber 1991
 BOND_PARAMS = {
-    "n_len": 1.33,
+    "n_len": 1.329,
     "ca_len": 1.46,
     "c_len": 1.52,
     "ang_C_N_CA": math.radians(121.7),
@@ -67,6 +121,13 @@ RAMA_SIGMA = {
     "GLY": (0.6, 0.6),
     "PRO": (0.5, 0.5)
 }
+
+OMEGA_SIGMA = {
+    "TRANS": math.radians(5.0),
+    "PREPRO": math.radians(5.0),
+}
+
+OMEGA_CIS_BIAS = 3.0
 
 # Advanced Rotamer Library (Approximation of Dunbrack 2010 top probabilities)
 # {AA: [(chi1, chi2, ...), ...]}
@@ -121,18 +182,30 @@ MJ_VALUES = [
 [-0.61, 0.23, 0.02, 0.07,-0.50,-0.05, 0.02,-0.18, 0.11,-0.78,-0.88, 0.26,-0.64,-0.84, 0.12,-0.20,-0.16,-0.76,-0.60,-0.84]
 ]
 
-def check_gpu_availability():
+def check_gpu_availability(preferred_backend="auto"):
     """
-    Checks for available hardware acceleration devices in order of preference.
-    Support:
-    1. DirectML (Windows/Linux) -> AMD, Intel, NVIDIA, Qualcomm (Broadest iGPU support)
-    2. CUDA (NVIDIA) -> NVIDIA dGPU
-    3. ROCm (AMD) -> AMD dGPU/APU (Linux mostly)
-    4. MPS (macOS) -> Apple Silicon (M1/M2/M3)
-    5. Intel XPU (IPEX) -> Intel Arc/Iris (Future support)
+    Checks for available hardware acceleration devices.
+    preferred_backend: "auto", "ipex", "directml", "cuda", "mps", "cpu"
     """
-    # 1. DirectML (Best for Windows iGPU: Intel Iris/Arc, AMD Radeon, Qualcomm Adreno)
-    if _HAS_DML:
+    if preferred_backend in ["cpu", "oneapi_cpu"]:
+        name = "Intel oneAPI CPU" if preferred_backend == "oneapi_cpu" else "Forced CPU"
+        return False, name, "CPU"
+
+    # 1. IPEX XPU
+    if preferred_backend in ["auto", "ipex"]:
+        ipex_mod, ipex_err = _load_ipex()
+        if ipex_mod is not None:
+            try:
+                if hasattr(torch, "xpu") and torch.xpu.is_available():
+                    name = torch.xpu.get_device_name(0)
+                    return True, f"{name} (via IPEX)", "Intel XPU"
+            except Exception:
+                pass
+        elif preferred_backend == "ipex" and ipex_err is not None:
+            return False, f"IPEX load failed: {ipex_err}", "CPU"
+            
+    # 2. DirectML
+    if preferred_backend in ["auto", "directml"] and _HAS_DML:
         try:
             dml_dev = torch_directml.device()
             # Verify basic tensor op
@@ -141,25 +214,18 @@ def check_gpu_availability():
         except Exception as e:
             logger.warning(f"DirectML available but failed init: {e}")
 
-    # 2. CUDA (NVIDIA Standard)
-    if torch.cuda.is_available():
+    # 3. CUDA
+    if preferred_backend in ["auto", "cuda"] and torch.cuda.is_available():
         try:
             name = torch.cuda.get_device_name(0)
         except Exception:
             name = "NVIDIA CUDA"
         return True, name, "NVIDIA Tensor Core"
         
-    # 3. Apple MPS (Mac)
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    # 4. MPS
+    if preferred_backend in ["auto", "mps"] and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         return True, "Apple Neural Engine (MPS)", "Apple NPU"
         
-    # 4. Intel XPU (Linux/WSL specific, usually requires intel_extension_for_pytorch)
-    try:
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-             return True, "Intel XPU (Arc/Iris)", "Intel XPU"
-    except:
-        pass
-
     return False, "No dedicated GPU detected", "CPU"
 
 def _normalize_chains_to_seq_len(chain_ss_list, seq_len):
@@ -185,7 +251,7 @@ def _normalize_chains_to_seq_len(chain_ss_list, seq_len):
     parts[-1] = parts[-1] + ("C" * add)
     return parts
 
-def ss_to_phi_psi_tensor(ss):
+def ss_to_phi_psi_tensor(ss, sequence=None):
     """
     Initializes Phi/Psi angles based on Secondary Structure (SS) with DISCRETE SAMPLING from allowed Ramachandran regions.
     
@@ -200,74 +266,61 @@ def ss_to_phi_psi_tensor(ss):
     """
     phi = []
     psi = []
-    
-    for c in ss:
+
+    seq = sequence if sequence is not None else ("A" * len(ss))
+    for i, c in enumerate(ss):
+        aa = seq[i] if i < len(seq) else "A"
         if c == "H":
-            # Alpha Helix: Tight constraints
-            p = -60.0 + np.random.uniform(-10.0, 10.0)
-            s = -47.0 + np.random.uniform(-10.0, 10.0)
+            p = math.radians(-60.0) + np.random.uniform(-1.0, 1.0) * math.radians(10.0)
+            q = math.radians(-47.0) + np.random.uniform(-1.0, 1.0) * math.radians(10.0)
         elif c == "E":
-            # Beta Sheet: Broader allowed region
-            p = -120.0 + np.random.uniform(-20.0, 20.0)
-            s = 120.0 + np.random.uniform(-20.0, 20.0)
+            p = math.radians(-120.0) + np.random.uniform(-1.0, 1.0) * math.radians(20.0)
+            q = math.radians(120.0) + np.random.uniform(-1.0, 1.0) * math.radians(20.0)
         else:
-            # Coil: Discrete sampling from allowed basins
-            # 40% Beta-like, 30% Alpha-like, 30% PPII-like
-            r = np.random.rand()
-            if r < 0.4: # Beta-like basin
-                p = -120.0 + np.random.uniform(-30.0, 30.0)
-                s = 120.0 + np.random.uniform(-30.0, 30.0)
-            elif r < 0.7: # Alpha-like basin
-                p = -60.0 + np.random.uniform(-20.0, 20.0)
-                s = -45.0 + np.random.uniform(-20.0, 20.0)
-            else: # PPII / Left-handed helix region (common in loops)
-                p = -75.0 + np.random.uniform(-20.0, 20.0)
-                s = 145.0 + np.random.uniform(-20.0, 20.0)
-                
-        phi.append(math.radians(p))
-        psi.append(math.radians(s))
-        
+            grp = "GLY" if aa == "G" else ("PRO" if aa == "P" else "General")
+            centers = RAMA_PREF.get(grp, RAMA_PREF["General"])
+            sig = RAMA_SIGMA.get(grp, RAMA_SIGMA["General"])
+            if grp == "PRO" and len(centers) >= 2:
+                k = 0 if (np.random.rand() < 0.7) else 1
+            elif grp == "General" and len(centers) >= 2:
+                k = 1 if (np.random.rand() < 0.6) else 0
+            else:
+                k = int(np.random.randint(0, len(centers)))
+            cp, cq = centers[k]
+            p = float(cp) + np.random.normal(0.0, float(sig[0]))
+            q = float(cq) + np.random.normal(0.0, float(sig[1]))
+
+        if aa == "P":
+            p = math.radians(-65.0) + np.random.normal(0.0, math.radians(7.0))
+
+        phi.append(float(p))
+        psi.append(float(q))
+
     return torch.tensor(phi, dtype=torch.float32), torch.tensor(psi, dtype=torch.float32)
 
-def place_atom_tensor(a, b, c, bond_len, bond_angle, dihedral):
+def place_atom_tensor(a, b, c, bond_len, bond_angle, dihedral, basis_x=None, basis_y=None):
     bc = c - b
     ab = b - a
     bc_l = torch.norm(bc) + 1e-9
     bc_u = bc / bc_l
-    def _cross3(u, v):
-        return torch.stack([
-            u[1] * v[2] - u[2] * v[1],
-            u[2] * v[0] - u[0] * v[2],
-            u[0] * v[1] - u[1] * v[0]
-        ])
-    n = _cross3(ab, bc_u)
+    n = torch.linalg.cross(ab, bc_u)
     n_l = torch.norm(n)
-    
-    # Robust normal calculation for collinear case
-    # If n_l is too small, ab and bc are collinear.
-    # We construct an arbitrary normal perpendicular to bc_u.
-    
-    # We use a mask-free approach for differentiability where possible, 
-    # but here a conditional is safer for stability.
-    # Since this function is usually called in a loop (not batched), we can check n_l value if scalar?
-    # But n_l is a tensor (scalar tensor).
-    
-    # If we are in a batch, we need torch.where. 
-    # Assuming single-instance calls for now as per loop in build_full_structure_tensor.
-    
-    if n_l < 1e-6:
-        # Create arbitrary vector not parallel to bc_u
-        # If bc_u is near x-axis, use y-axis
-        if torch.abs(bc_u[0]) < 0.9:
-            arb = torch.tensor([1.0, 0.0, 0.0], device=a.device, dtype=a.dtype)
-        else:
-            arb = torch.tensor([0.0, 1.0, 0.0], device=a.device, dtype=a.dtype)
-            
-        n = _cross3(arb, bc_u)
-        n_l = torch.norm(n)
-        
+
+    if basis_x is None:
+        basis_x = torch.tensor([1.0, 0.0, 0.0], device=a.device, dtype=a.dtype)
+    if basis_y is None:
+        basis_y = torch.tensor([0.0, 1.0, 0.0], device=a.device, dtype=a.dtype)
+
+    arb = torch.where(torch.abs(bc_u[0]) < 0.9, basis_x, basis_y)
+    n_alt = torch.linalg.cross(arb, bc_u)
+    n_alt_l = torch.norm(n_alt)
+
+    collinear = n_l < 1e-6
+    n = torch.where(collinear, n_alt, n)
+    n_l = torch.where(collinear, n_alt_l, n_l)
+
     n = n / (n_l + 1e-9)
-    nb = _cross3(n, bc_u)
+    nb = torch.linalg.cross(n, bc_u)
     nb = nb / (torch.norm(nb) + 1e-9)
     
     x = -bond_len * torch.cos(bond_angle)
@@ -307,189 +360,171 @@ def _apply_transform_tensor(coords, trans, rot_angles, device):
     # Matmul: (N,3) x (3,3) -> (N,3)
     return torch.matmul(coords, R.t()) + trans
 
-def build_full_structure_tensor(sequence, phi, psi, device):
+def _get_bond_constants(device):
+    p = BOND_PARAMS
+    d = {}
+    d["n_len"] = torch.tensor(p["n_len"], device=device)
+    d["ca_len"] = torch.tensor(p["ca_len"], device=device)
+    d["c_len"] = torch.tensor(p["c_len"], device=device)
+    d["ang_C_N_CA"] = torch.tensor(p["ang_C_N_CA"], device=device)
+    d["ang_N_CA_C"] = torch.tensor(p["ang_N_CA_C"], device=device)
+    d["ang_CA_C_N"] = torch.tensor(p["ang_CA_C_N"], device=device)
+    d["zero"] = torch.tensor(0.0, device=device)
+    d["omega"] = torch.tensor(math.pi, device=device)
+    d["bond_NH"] = torch.tensor(1.01, device=device)
+    d["bond_CO"] = torch.tensor(1.229, device=device)
+    d["bond_CB"] = torch.tensor(1.53, device=device)
+    
+    d["rad_120_8"] = torch.tensor(math.radians(120.8), device=device)
+    d["rad_110_5"] = torch.tensor(math.radians(110.5), device=device)
+    d["rad_neg_122_5"] = torch.tensor(math.radians(-122.5), device=device)
+    d["rad_122_55"] = torch.tensor(math.radians(122.55), device=device)
+    d["rad_119_5"] = torch.tensor(math.radians(119.5), device=device)
+    d["pi"] = torch.tensor(math.pi, device=device)
+    d["neg_47"] = torch.tensor(math.radians(-47.0), device=device)
+    
+    d["init_N"] = torch.tensor([0.0, 0.0, 0.0], device=device)
+    d["init_CA"] = torch.tensor([p["ca_len"], 0.0, 0.0], device=device)
+    d["prev_virtual"] = torch.tensor([-0.5 * p["c_len"], 0.866 * p["c_len"], 0.0], device=device)
+    d["dummy_H"] = torch.tensor([0.0, 0.0, 0.0], device=device)
+    d["basis_x"] = torch.tensor([1.0, 0.0, 0.0], device=device)
+    d["basis_y"] = torch.tensor([0.0, 1.0, 0.0], device=device)
+    return d
+
+def _carbonyl_oxygen_tensor(Ci, CAi, Nnext, bond_len):
+    v1 = CAi - Ci
+    v2 = Nnext - Ci
+    u1 = v1 / (torch.norm(v1) + 1e-9)
+    u2 = v2 / (torch.norm(v2) + 1e-9)
+    d = -(u1 + u2)
+    dn = torch.norm(d)
+    d = torch.where(dn > 1e-6, d / (dn + 1e-9), -u1)
+    return Ci + d * bond_len
+
+def build_full_structure_tensor(seq_len, phi, psi, device, bond_constants=None, omega=None):
     """
     Builds Backbone + CB (Centroid) + H (Amide) + O (Carbonyl).
-    Note: Full sidechain rotamer optimization is expensive in pure python loop.
-    We implement "Backbone + Centroid" model for speed, 
-    but include H and O for H-bond calculation.
+    Optimized to use precomputed bond constants to avoid CPU-GPU overhead.
     """
-    p = BOND_PARAMS
-    n_len = torch.tensor(p["n_len"], device=device)
-    ca_len = torch.tensor(p["ca_len"], device=device)
-    c_len = torch.tensor(p["c_len"], device=device)
-    ang_C_N_CA = torch.tensor(p["ang_C_N_CA"], device=device)
-    ang_N_CA_C = torch.tensor(p["ang_N_CA_C"], device=device)
-    ang_CA_C_N = torch.tensor(p["ang_CA_C_N"], device=device)
+    if bond_constants is None:
+        bc = _get_bond_constants(device)
+    else:
+        bc = bond_constants
+        
+    n_len = bc["n_len"]
+    ca_len = bc["ca_len"]
+    c_len = bc["c_len"]
+    ang_C_N_CA = bc["ang_C_N_CA"]
+    ang_N_CA_C = bc["ang_N_CA_C"]
+    ang_CA_C_N = bc["ang_CA_C_N"]
     
     # Init
-    N = torch.tensor([0.0, 0.0, 0.0], device=device)
-    CA = torch.tensor([ca_len.item(), 0.0, 0.0], device=device)
+    N = bc["init_N"]
+    CA = bc["init_CA"]
+    prev_virtual = bc["prev_virtual"]
     
-    # Virtual previous atom C(-1)
-    # Must NOT be collinear with N-CA (X-axis)
-    # Place it at angle ~120 deg to X-axis in XY plane
-    # x = -cos(120)*len, y = sin(120)*len
-    prev_virtual = torch.tensor([-0.5 * c_len.item(), 0.866 * c_len.item(), 0.0], device=device)
+    C = place_atom_tensor(prev_virtual, N, CA, c_len, ang_N_CA_C, bc["zero"])
     
-    C = place_atom_tensor(prev_virtual, N, CA, c_len, ang_N_CA_C, torch.tensor(0.0, device=device))
+    coords_N = torch.empty((seq_len, 3), device=device, dtype=N.dtype)
+    coords_CA = torch.empty((seq_len, 3), device=device, dtype=N.dtype)
+    coords_C = torch.empty((seq_len, 3), device=device, dtype=N.dtype)
+    coords_O = torch.empty((seq_len, 3), device=device, dtype=N.dtype)
+    coords_H = torch.empty((seq_len, 3), device=device, dtype=N.dtype)
+    coords_CB = torch.empty((seq_len, 3), device=device, dtype=N.dtype)
     
-    coords_N = [N]
-    coords_CA = [CA]
-    coords_C = [C]
-    coords_O = [] # Carbonyl Oxygen
-    coords_H = [] # Amide Hydrogen
-    coords_CB = [] # Sidechain Centroid/CB
+    omega_const = bc["omega"]
+    bond_NH = bc["bond_NH"]
+    bond_CO = bc["bond_CO"]
+    bond_CB = bc["bond_CB"]
     
-    # LOCK OMEGA: Peptide bond must be planar and usually TRANS (180 deg).
-    # We fix omega to 180 degrees (pi radians) for all residues.
-    # Cis-proline (~0 deg) is rare (5%), we ignore it for now to ensure stability.
-    omega = torch.tensor(math.pi, device=device) # Trans (180 deg)
-    
-    # H-bond parameters
-    bond_NH = torch.tensor(1.01, device=device) # N-H length
-    bond_CO = torch.tensor(1.23, device=device) # C=O length
-    
-    # Place first H? No H on N-term usually (NH3+)
-    coords_H.append(torch.tensor([0.0,0.0,0.0], device=device)) # Dummy
-    
-    # Place first O
-    # O is in the plane of CA-C-N(next) usually, but here we place relative to N-CA-C frame
-    # Vector C=O bisects N-C-CA exterior angle? 
-    # Roughly: place O opposite to bisector of N-C-CA
-    # Or simply: place_atom(CA, C, N, bond_CO, 120deg, pi)
-    O0 = place_atom_tensor(CA, C, N, bond_CO, torch.tensor(math.radians(120.8), device=device), torch.tensor(math.pi, device=device))
-    coords_O.append(O0)
+    coords_N[0] = N
+    coords_CA[0] = CA
+    coords_C[0] = C
+    coords_H[0] = bc["dummy_H"]
     
     # Place first CB
-    # Standard geometry from N, C, CA
-    # place_atom(N, CA, C, 1.53, 110deg, -120deg)?
-    CB0 = place_atom_tensor(N, CA, C, torch.tensor(1.53, device=device), torch.tensor(math.radians(110.5), device=device), torch.tensor(math.radians(-122.5), device=device))
-    coords_CB.append(CB0)
+    basis_x = bc.get("basis_x")
+    basis_y = bc.get("basis_y")
+    CB0 = place_atom_tensor(N, CA, C, bond_CB, bc["rad_110_5"], bc["rad_neg_122_5"], basis_x=basis_x, basis_y=basis_y)
+    coords_CB[0] = CB0
 
-    for i in range(1, len(sequence)):
-        Ni = place_atom_tensor(coords_N[i-1], coords_CA[i-1], coords_C[i-1], n_len, ang_CA_C_N, psi[i-1])
-        CAi = place_atom_tensor(coords_CA[i-1], coords_C[i-1], Ni, ca_len, ang_C_N_CA, omega)
-        Ci = place_atom_tensor(coords_C[i-1], Ni, CAi, c_len, ang_N_CA_C, phi[i])
-        
-        coords_N.append(Ni)
-        coords_CA.append(CAi)
-        coords_C.append(Ci)
-        
-        # Place H on N(i)
-        # H is on bisector of C(i-1)-N(i)-CA(i)
-        # place_atom(C(i-1), N(i), CA(i), 1.01, 120, pi)
-        Hi = place_atom_tensor(coords_C[i-1], Ni, CAi, bond_NH, torch.tensor(math.radians(119.5), device=device), torch.tensor(math.pi, device=device))
-        coords_H.append(Hi)
-        
-        # Place O on C(i)
-        # Correct geometry: O is connected to C.
-        # The plane is defined by CA(i)-C(i)-N(i+1) usually, but here we build C(i) from N(i), CA(i).
-        # We need to place O relative to the frame N(i)-CA(i)-C(i).
-        # Standard: O and N(i) are trans (180) or cis (0) across CA-C bond? No.
-        # The bond C=O is in the plane of CA-C-N(next).
-        # But we haven't placed N(i+1) yet! 
-        # Actually, in NeRF, we place O using the previous atoms that defined C.
-        # Frame: N(i), CA(i), C(i).
-        # C=O bisects the angle N(i+1)-C-CA? No.
-        # In a standard peptide unit (trans), O and N(i) are on OPPOSITE sides of the CA-C bond line in projection? No.
-        # O and H are anti-parallel in beta sheet.
-        # Correct construction:
-        # Torsion N(i)-CA(i)-C(i)-O(i) should be distinct.
-        # Usually, psi is N-CA-C-N(next).
-        # O is typically related to psi. O-C-CA-N dihedral is psi + 180 (approx).
-        # Let's use place_atom(N, CA, C, ...)
-        
-        # Standard O placement:
-        # Bond C=O: 1.23 A
-        # Angle CA-C-O: ~120.8 degrees
-        # Dihedral N-CA-C-O: This is related to psi. 
-        # If we are building iteratively and don't have N(next) yet, we can't strictly enforce planarity with N(next).
-        # However, we can enforce that O lies in the plane that *will* contain N(next).
-        # Wait, build_full_structure_tensor iterates i. 
-        # At step i, we place Ni, CAi, Ci. 
-        # Then we place Oi attached to Ci.
-        # We need to ensure O is placed such that when N(i+1) is placed later, O-C-N(next) is planar.
-        # But N(i+1) placement depends on psi[i] and omega[i].
-        # Actually, the standard NeRF chain places N(i+1) based on C(i).
-        # The torsion angle for N(i+1) is psi[i]. (Technically N-CA-C-N is psi).
-        # The torsion angle for O(i) should be roughly psi[i] - 180 degrees (trans O vs N).
-        # So place_atom(Ni, CAi, Ci, bond_CO, ang_CA_C_O, psi[i] + pi).
-        
-        # We need psi[i] here. The loop uses psi[i-1] to place Ni.
-        # So we have psi[i] available (it's in the input list).
-        
-        # Note: input 'psi' list length = seq_len. psi[i] defines N(i)-CA(i)-C(i)-N(i+1).
-        # For the last residue, psi is arbitrary or undefined, we can use default.
-        
-        current_psi = psi[i] if i < len(psi) else torch.tensor(math.radians(-47.0), device=device) # Default helix-like if missing
-        
-        # place_atom(a, b, c, len, angle, torsion) -> places d
-        # torsion is angle between plane(abc) and plane(bcd).
-        # Here a=N, b=CA, c=C. We want d=O.
-        # Torsion N-CA-C-O.
-        # We know N-CA-C-N(next) is psi.
-        # O is usually trans to N(next) across the C-CA bond? No, O and N(next) are cis-like in projection?
-        # Actually, C=O and C-N(next) are roughly 120 deg apart in the plane.
-        # N-CA-C-O ~= psi - 180 (or +180).
-        
-        Oi = place_atom_tensor(Ni, CAi, Ci, bond_CO, torch.tensor(math.radians(120.8), device=device), current_psi + torch.tensor(math.pi, device=device))
-        coords_O.append(Oi)
-        
-        # Place CB on CA(i)
-        # Correct Chirality for L-amino acids.
-        # Frame: N(i), C(i), CA(i) -- Note order for place_atom base.
-        # Standard definition: N-C-CA-CB dihedral.
-        # For L-Ala: N-C-CA-CB is approx 122.5 deg.
-        # place_atom(N, C, CA, ...) -> N-C-CA plane is reference.
-        # Wait, usually we define CB relative to N-CA-C frame.
-        # place_atom(N, C, CA) is weird because C is not connected to N in that order.
-        # Standard: place_atom(N, C, CA) means a=N, b=C, c=CA? No, connectivity is N-CA-C.
-        # To place CB on CA, we use N and C as reference.
-        # Base atoms: N, C, CA. (CA is 'c', C is 'b', N is 'a'?) No.
-        # CA is the central atom.
-        # Let's use place_atom(Ni, Ci, CAi, ...) -> this assumes Ni-Ci bond exists? No.
-        # place_atom geometry assumes a-b-c chain.
-        # Ni is connected to CAi. Ci is connected to CAi.
-        # So we can't use standard place_atom(A,B,C) directly if A,B,C are not a chain.
-        # But we can use place_atom(Ni, Ci, CAi) if we treat it as a virtual chain N-C-CA? No.
-        
-        # Alternative: Re-use the place_atom logic but with Ni-CAi-Ci as the frame.
-        # We want to place CB attached to CAi.
-        # Torsion N-C-CA-CB? 
-        # Let's stick to the frame Ni, CAi, Ci.
-        # We place CB relative to N-CA-C.
-        # Torsion N-CA-C-CB.
-        # For L-amino acids, N-CA-C-CB is approx -122.5 degrees (magic number).
-        # place_atom(Ni, CAi, Ci, ...) places atom d such that N-CA-C-d is torsion.
-        # But place_atom(a,b,c) defines torsion relative to a-b-c.
-        # So place_atom(Ni, CAi, Ci, CB_len, angle_C_CA_CB, torsion_N_CA_C_CB)
-        # Angle C-CA-CB is typically ~110.5 deg.
-        
-        # Wait, the previous code used:
-        # place_atom_tensor(Ni, CAi, Ci, 1.53, 110.5, 122.5)
-        # Positive 122.5 gives D-amino acid? Or L?
-        # Standard N-CA-C-CB for L-Ala is roughly 122.6 deg.
-        # Let's verify chirality.
-        # If we look down CA-C bond, N is up, CB should be left/right?
-        # Let's stick to the standard value 122.55 for L-AA.
-        
-        CBi = place_atom_tensor(Ni, CAi, Ci, torch.tensor(1.53, device=device), torch.tensor(math.radians(110.5), device=device), torch.tensor(math.radians(122.55), device=device))
-        coords_CB.append(CBi)
-        
-    return (torch.stack(coords_N), torch.stack(coords_CA), torch.stack(coords_C), 
-            torch.stack(coords_O), torch.stack(coords_H), torch.stack(coords_CB))
+    for i in range(1, seq_len):
+        Ni = place_atom_tensor(coords_N[i-1], coords_CA[i-1], coords_C[i-1], n_len, ang_CA_C_N, psi[i-1], basis_x=basis_x, basis_y=basis_y)
+        om = omega_const if omega is None else omega[i - 1]
+        CAi = place_atom_tensor(coords_CA[i-1], coords_C[i-1], Ni, ca_len, ang_C_N_CA, om, basis_x=basis_x, basis_y=basis_y)
+        Ci = place_atom_tensor(coords_C[i-1], Ni, CAi, c_len, ang_N_CA_C, phi[i], basis_x=basis_x, basis_y=basis_y)
 
-def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
+        coords_O[i - 1] = _carbonyl_oxygen_tensor(coords_C[i-1], coords_CA[i-1], Ni, bond_CO)
+        nrm = torch.linalg.cross(coords_CA[i-1] - coords_N[i-1], coords_C[i-1] - coords_CA[i-1])
+        nrm = nrm / (torch.norm(nrm) + 1e-9)
+        dproj = torch.sum((coords_O[i - 1] - coords_N[i-1]) * nrm)
+        coords_O[i - 1] = coords_O[i - 1] - dproj * nrm
+
+        coords_N[i] = Ni
+        coords_CA[i] = CAi
+        coords_C[i] = Ci
+
+        coords_H[i] = place_atom_tensor(coords_C[i-1], Ni, CAi, bond_NH, bc["rad_119_5"], bc["pi"], basis_x=basis_x, basis_y=basis_y)
+        coords_CB[i] = place_atom_tensor(Ni, CAi, Ci, bond_CB, bc["rad_110_5"], bc["rad_122_55"], basis_x=basis_x, basis_y=basis_y)
+
+    if seq_len > 0:
+        last_idx = seq_len - 1
+        coords_O[last_idx] = _carbonyl_oxygen_tensor(coords_C[last_idx], coords_CA[last_idx], coords_N[last_idx], bond_CO)
+        nrm = torch.linalg.cross(coords_CA[last_idx] - coords_N[last_idx], coords_C[last_idx] - coords_CA[last_idx])
+        nrm = nrm / (torch.norm(nrm) + 1e-9)
+        dproj = torch.sum((coords_O[last_idx] - coords_N[last_idx]) * nrm)
+        coords_O[last_idx] = coords_O[last_idx] - dproj * nrm
+
+    return coords_N, coords_CA, coords_C, coords_O, coords_H, coords_CB
+
+def _get_cpu_threads():
+    try:
+        val = os.environ.get("ONEAPI_CPU_THREADS") or os.environ.get("MINIFOLD_CPU_THREADS")
+        if val:
+            return max(1, int(val))
+    except Exception:
+        pass
+    try:
+        return max(1, os.cpu_count() or 1)
+    except Exception:
+        return 1
+
+def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, backend="auto"):
     """
     Advanced Full-Atom Joint Optimization Pipeline.
     """
-    is_gpu, device_name, device_type = check_gpu_availability()
+    is_gpu, device_name, device_type = check_gpu_availability(preferred_backend=backend)
     logger.info(f"iGPU Optimization Enabled [{ALGO_VERSION}]. Device: {device_name} ({device_type})")
     
     device = torch.device('cpu')
+    use_ipex = False
+    ipex_mod = None
+    if backend == "oneapi_cpu":
+        try:
+            th = _get_cpu_threads()
+            try:
+                torch.set_num_threads(th)
+            except Exception:
+                pass
+            try:
+                if hasattr(torch, "set_num_interop_threads"):
+                    torch.set_num_interop_threads(max(1, th // 2))
+            except Exception:
+                pass
+            os.environ["OMP_NUM_THREADS"] = str(th)
+            os.environ["MKL_NUM_THREADS"] = str(th)
+        except Exception:
+            pass
+    
     if is_gpu:
-        if device_type == "DirectML":
+        if device_type == "Intel XPU":
+            ipex_mod, ipex_err = _load_ipex()
+            if ipex_mod is not None:
+                device = torch.device("xpu")
+                use_ipex = True
+            else:
+                logger.warning(f"IPEX load failed: {ipex_err}")
+        elif device_type == "DirectML":
             device = torch_directml.device()
         elif device_type == "NVIDIA Tensor Core" or device_type == "AMD ROCm":
             device = torch.device('cuda')
@@ -508,10 +543,12 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
     start_idx = 0
     
     for ss in chain_ss_list:
-        L = len(ss)
-        sub_seq = sequence[start_idx : start_idx + L]
-        start_idx += L
-        p, q = ss_to_phi_psi_tensor(ss)
+        L_ss = len(ss)
+        sub_seq = sequence[start_idx : start_idx + L_ss]
+        L_seq = len(sub_seq)
+        if L_seq < L_ss:
+            ss = ss[:L_seq]
+        p, q = ss_to_phi_psi_tensor(ss, sub_seq)
         
         # Create weights: 0.1 for 'C', 1.0 for others
         w_list = [0.1 if c == 'C' else 1.0 for c in ss]
@@ -536,22 +573,41 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         POLAR_SET = set(['D','E','K','R','H','N','Q','S','T','Y','C','W'])
         AROMATIC_SET = set(['F','Y','W'])
         
+        # User-defined sets for primitive collapse
+        COLLAPSE_HYDRO_SET = set(['I', 'L', 'V', 'F', 'M'])
+        CHARGED_CLASH_SET = set(['D', 'E', 'K', 'R'])
+
         h_idx_list = []
         c_val_list = []
         polar_list = []
         arom_list = []
         
+        col_hydro_list = []
+        chg_clash_list = []
+
         for aa in sub_seq:
             h_idx_list.append(HP_MAP.get(aa, 0.0))
             c_val_list.append(CHARGE_MAP.get(aa, 0.0))
             polar_list.append(1.0 if aa in POLAR_SET else 0.0)
             arom_list.append(1.0 if aa in AROMATIC_SET else 0.0)
             
+            col_hydro_list.append(1.0 if aa in COLLAPSE_HYDRO_SET else 0.0)
+            chg_clash_list.append(1.0 if aa in CHARGED_CLASH_SET else 0.0)
+            
         hydro_mask = torch.tensor(h_idx_list, device=device)
         charge = torch.tensor(c_val_list, device=device)
         polar_mask = torch.tensor(polar_list, device=device)
         aromatic_mask = torch.tensor(arom_list, device=device)
         
+        collapse_hydro_mask = torch.tensor(col_hydro_list, device=device)
+        charged_clash_mask = torch.tensor(chg_clash_list, device=device)
+        
+        rama_group_ids = torch.tensor(
+            [1 if a == "G" else (2 if a == "P" else 0) for a in sub_seq],
+            device=device,
+            dtype=torch.long,
+        )
+
         chain_data.append({
             "seq": sub_seq,
             "ss": ss,
@@ -560,21 +616,35 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
             "ss_weights": w_tensor,
             "hydro_mask": hydro_mask,
             "charge": charge,
-            "polar_mask": polar_mask
-            ,"aromatic_mask": aromatic_mask
+            "polar_mask": polar_mask,
+            "aromatic_mask": aromatic_mask,
+            "collapse_hydro_mask": collapse_hydro_mask,
+            "charged_clash_mask": charged_clash_mask,
+            "rama_group_ids": rama_group_ids,
+            "prepro_mask": torch.tensor([1.0 if (j + 1 < len(sub_seq) and sub_seq[j + 1] == "P") else 0.0 for j in range(len(sub_seq))], device=device, dtype=torch.float32),
         })
         
+        start_idx += L_seq
+        
+    used_sequence = "".join([d["seq"] for d in chain_data])
     num_chains = len(chain_data)
     
     # Initialize Parameters
     phi_params = []
     psi_params = []
+    omega_params = []
     
     for d in chain_data:
         p0 = d["phi_ref"] + (torch.rand_like(d["phi_ref"]) * 0.1)
         q0 = d["psi_ref"] + (torch.rand_like(d["psi_ref"]) * 0.1)
         phi_params.append(p0.requires_grad_(True))
         psi_params.append(q0.requires_grad_(True))
+        o0 = torch.full_like(d["phi_ref"], math.pi)
+        prepro_mask = d.get("prepro_mask")
+        if prepro_mask is not None and prepro_mask.numel() == o0.numel():
+            cis_sample = (torch.rand_like(o0) < 0.05) & (prepro_mask > 0.5)
+            o0 = torch.where(cis_sample, torch.zeros_like(o0), o0)
+        omega_params.append(o0.requires_grad_(True))
         
     rb_params = None
     if len(chain_data) > 1:
@@ -585,7 +655,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
             init_rb.append(torch.cat([t, r]))
         rb_params = torch.stack(init_rb).requires_grad_(True)
         
-    all_params = phi_params + psi_params
+    all_params = phi_params + psi_params + omega_params
     if rb_params is not None:
         all_params.append(rb_params)
         
@@ -598,63 +668,148 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
     # Stage 1: Adam (Fast coarse folding)
     # Stage 2: LBFGS (Fine refinement)
     
-    # unified loss function and optimization below
-    
+    # Enable IPEX optimization if available (Intel Arc/Ultra)
+    if use_ipex:
+        try:
+            logger.info("Applying Intel IPEX optimizations (BFloat16/Float16 weights)...")
+            # Convert parameters to optimize format if needed, though functional approach makes it tricky.
+            # IPEX usually optimizes modules. For functional tensors, we focus on XPU device backend.
+            # However, we can use torch.xpu.optimize if available in newer IPEX versions, or just rely on XPU backend.
+            # We can try to use ipex.optimize on the optimizer if we had a module.
+            pass
+        except Exception as e:
+            logger.warning(f"IPEX optimization warning: {e}")
+
+    rama_groups = ["General", "GLY", "PRO"]
+    rama_group_index = {k: i for i, k in enumerate(rama_groups)}
+    rama_kmax = max(len(RAMA_PREF[g]) for g in rama_groups)
+    rama_centers_pad = torch.zeros((len(rama_groups), rama_kmax, 2), device=device, dtype=torch.float32)
+    rama_valid_pad = torch.zeros((len(rama_groups), rama_kmax), device=device, dtype=torch.float32)
+    rama_sigma = torch.zeros((len(rama_groups), 2), device=device, dtype=torch.float32)
+    for g in rama_groups:
+        gi = rama_group_index[g]
+        centers = torch.tensor(RAMA_PREF[g], device=device, dtype=torch.float32)
+        k = centers.shape[0]
+        rama_centers_pad[gi, :k, :] = centers
+        rama_valid_pad[gi, :k] = 1.0
+        rama_sigma[gi, :] = torch.tensor(RAMA_SIGMA[g], device=device, dtype=torch.float32)
+        
+    # Precompute MJ tensor
     mj_tensor = torch.tensor(MJ_VALUES, dtype=torch.float32, device=device)
+    
+    # Precompute Bond Constants for reuse
+    bond_constants = _get_bond_constants(device)
+
+    chain_lengths = [len(d["seq"]) for d in chain_data]
+    total_residues = int(sum(chain_lengths))
+    chain_ids = torch.cat(
+        [torch.full((L,), i, device=device, dtype=torch.long) for i, L in enumerate(chain_lengths)],
+        dim=0,
+    )
+    aa_indices = torch.tensor(
+        [MJ_INDEX.get(a, MJ_INDEX["A"]) for d in chain_data for a in d["seq"]],
+        device=device,
+        dtype=torch.long,
+    )
+
+    full_hydro = torch.cat([d["hydro_mask"] for d in chain_data], dim=0)
+    full_charge = torch.cat([d["charge"] for d in chain_data], dim=0)
+    full_polar = torch.cat([d["polar_mask"] for d in chain_data], dim=0)
+    full_aromatic = torch.cat([d["aromatic_mask"] for d in chain_data], dim=0)
+    
+    full_collapse_hydro = torch.cat([d["collapse_hydro_mask"] for d in chain_data], dim=0)
+    full_charged_clash = torch.cat([d["charged_clash_mask"] for d in chain_data], dim=0)
+
+    idx = torch.arange(total_residues, device=device)
+    idx_diff = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
+    mask_nonlocal = (torch.triu(torch.ones((total_residues, total_residues), device=device), diagonal=3) > 0).float()
+    cross_mask = (chain_ids.unsqueeze(0) != chain_ids.unsqueeze(1)).float()
+
+    n_full_atoms = total_residues * 4
+    n_heavy_atoms = total_residues * 5
+    clash_mask = torch.triu(torch.ones((n_full_atoms, n_full_atoms), device=device), diagonal=2) > 0
+    heavy_pair_mask = torch.triu(torch.ones((n_heavy_atoms, n_heavy_atoms), device=device), diagonal=2) > 0
+
+    cys_indices = torch.nonzero(aa_indices == MJ_INDEX["C"]).flatten()
+    
     def calc_loss():
         all_N, all_CA, all_C, all_O, all_H, all_CB = [], [], [], [], [], []
         loss_ss = torch.tensor(0.0, device=device)
         loss_rama = torch.tensor(0.0, device=device)
         loss_smooth = torch.tensor(0.0, device=device)
-        chain_ids_collect = []
+        loss_omega = torch.tensor(0.0, device=device)
         
         # Build
         for i, d in enumerate(chain_data):
             phi = phi_params[i]
             psi = psi_params[i]
+            omega = omega_params[i]
             
             # SS Restraint (Adaptive)
-            ss_weights = torch.ones_like(phi, device=device)
-            if "ss_weights" in d:
-                ss_weights = d["ss_weights"]
+            ss_weights = d.get("ss_weights", torch.ones_like(phi, device=device))
             
             d_phi = torch.remainder(phi - d["phi_ref"] + math.pi, 2*math.pi) - math.pi
             d_psi = torch.remainder(psi - d["psi_ref"] + math.pi, 2*math.pi) - math.pi
             loss_ss = loss_ss + torch.sum(ss_weights * (d_phi**2 + d_psi**2))
             
-            group = "General"
-            if len(d["seq"]) > 0:
-                aa = d["seq"][0]
-                if aa == "G":
-                    group = "GLY"
-                elif aa == "P":
-                    group = "PRO"
-            centers = RAMA_PREF.get(group, RAMA_PREF["General"])
-            sigma = RAMA_SIGMA.get(group, RAMA_SIGMA["General"])
+            group_ids = d.get("rama_group_ids")
+            if group_ids is None:
+                group_ids = torch.zeros((len(d["seq"]),), device=device, dtype=torch.long)
+
+            c_t = rama_centers_pad.index_select(0, group_ids)  # (L, K, 2)
+            v_t = rama_valid_pad.index_select(0, group_ids)    # (L, K)
+            s_t = rama_sigma.index_select(0, group_ids)        # (L, 2)
+
+            phi_ex = phi.unsqueeze(1)  # (L, 1)
+            psi_ex = psi.unsqueeze(1)  # (L, 1)
+
+            dphi = torch.remainder(phi_ex - c_t[:, :, 0] + math.pi, 2 * math.pi) - math.pi
+            dpsi = torch.remainder(psi_ex - c_t[:, :, 1] + math.pi, 2 * math.pi) - math.pi
+
+            term = (dphi / (s_t[:, 0:1] + 1e-9)) ** 2 + (dpsi / (s_t[:, 1:2] + 1e-9)) ** 2
+            term = term + (1.0 - v_t) * 1e6
+
+            min_term = torch.min(term, dim=1)[0]
             
-            # Vectorized Rama Loss
-            c_t = torch.tensor(centers, device=device, dtype=torch.float32) # (K, 2)
-            s_t = torch.tensor(sigma, device=device, dtype=torch.float32)   # (2,)
+            # User Feedback: Relax Rama "Perfectionism"
+            # Allow 3% outliers (ignore the worst 3% of residues from the loss)
+            n_res = min_term.size(0)
+            n_keep = max(1, int(n_res * 0.97))
             
-            p_ex = phi.unsqueeze(1) # (L, 1)
-            q_ex = psi.unsqueeze(1) # (L, 1)
+            sorted_term, _ = torch.sort(min_term)
+            valid_term = sorted_term[:n_keep]
             
-            cp = c_t[:, 0].unsqueeze(0) # (1, K)
-            cq = c_t[:, 1].unsqueeze(0) # (1, K)
-            
-            term1 = ((p_ex - cp) / s_t[0])**2
-            term2 = ((q_ex - cq) / s_t[1])**2
-            
-            # Min over K, Sum over L
-            rama_sum = torch.sum(torch.min(term1 + term2, dim=1)[0])
-            loss_rama = loss_rama + rama_sum
+            # Soft Potential: Flat bottom (no force if within 1.0 sigma^2)
+            # Remove the hard penalty for outliers (relu(min_term - 4.0)**2 * 25.0)
+            rama_soft = torch.sum(torch.relu(valid_term - 1.0))
+            loss_rama = loss_rama + rama_soft
+
+            pro_mask = (group_ids == 2).float()
+            if pro_mask.numel() > 0:
+                pro_phi0 = torch.tensor(math.radians(-65.0), device=device)
+                pro_dphi = torch.remainder(phi - pro_phi0 + math.pi, 2 * math.pi) - math.pi
+                # Relaxed Proline constraint: Weight 10.0 -> 0.5 to allow kinks
+                loss_rama = loss_rama + torch.sum((pro_dphi / math.radians(10.0)) ** 2 * pro_mask) * 0.5
+
+            omega_valid = torch.ones_like(omega)
+            if omega_valid.numel() > 0:
+                omega_valid[-1] = 0.0
+            omega_wrap_trans = torch.remainder(omega - math.pi + math.pi, 2 * math.pi) - math.pi
+            trans_term = (omega_wrap_trans / (OMEGA_SIGMA["TRANS"] + 1e-9)) ** 2
+            cis_term = (torch.remainder(omega + math.pi, 2 * math.pi) - math.pi) / (OMEGA_SIGMA["PREPRO"] + 1e-9)
+            cis_term = cis_term ** 2 + OMEGA_CIS_BIAS
+            prepro_mask = d.get("prepro_mask")
+            if prepro_mask is None:
+                prepro_mask = torch.zeros_like(omega)
+            omega_term = torch.where(prepro_mask > 0.5, torch.minimum(trans_term, cis_term), trans_term)
+            loss_omega = loss_omega + torch.sum(omega_term * omega_valid) + torch.sum(torch.relu(omega_term - 1.0) ** 2 * omega_valid) * 50.0
             
             diff_phi = phi[1:] - phi[:-1]
             diff_psi = psi[1:] - psi[:-1]
             loss_smooth = loss_smooth + torch.sum(diff_phi**2 + diff_psi**2)
             
             # Build Structure
-            N, CA, C, O, H, CB = build_full_structure_tensor(d["seq"], phi, psi, device)
+            N, CA, C, O, H, CB = build_full_structure_tensor(len(d["seq"]), phi, psi, device, bond_constants, omega=omega)
             
             if i > 0 and rb_params is not None:
                 params = rb_params[i-1]
@@ -672,32 +827,11 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
             all_O.append(O)
             all_H.append(H)
             all_CB.append(CB)
-            chain_ids_collect.append(torch.full((len(d["seq"]),), i, device=device, dtype=torch.long))
             
         full_CA = torch.cat(all_CA)
         full_CB = torch.cat(all_CB)
         full_N = torch.cat(all_N)
         full_C = torch.cat(all_C)
-        chain_ids = torch.cat(chain_ids_collect)
-        aa_idx_collect = []
-        for d in chain_data:
-            aa_idx_collect.append(torch.tensor([MJ_INDEX.get(a, MJ_INDEX['A']) for a in d["seq"]], device=device))
-        aa_indices = torch.cat(aa_idx_collect)
-        
-        # Collect property tensors
-        all_hydro = []
-        all_charge = []
-        all_polar = []
-        all_aromatic = []
-        for d in chain_data:
-            all_hydro.append(d["hydro_mask"])
-            all_charge.append(d["charge"])
-            all_polar.append(d["polar_mask"])
-            all_aromatic.append(d["aromatic_mask"])
-        full_hydro = torch.cat(all_hydro)
-        full_charge = torch.cat(all_charge)
-        full_polar = torch.cat(all_polar)
-        full_aromatic = torch.cat(all_aromatic)
         
         # Rg (Compactness)
         centroid = torch.mean(full_CA, dim=0)
@@ -706,45 +840,49 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         rg_target = 2.2 * (len(full_CA) ** 0.38)
         loss_rg_target = (rg - rg_target) ** 2
         
-        # CA-CA Distance Continuity (Strict Constraint)
-        # Adjacent CA atoms should be ~3.8 Angstroms apart.
-        # This is already implicitly handled by the NeRF construction (fixed bond lengths/angles),
-        # but numerical drift or omega/phi/psi combinations might cause issues?
-        # Actually, NeRF *guarantees* bond lengths if they are fixed inputs.
-        # But we verify it here as a sanity check / soft constraint against drift.
-        # Let's enforce it explicitly to be safe.
+        full_omega = torch.cat(omega_params)
         diff_ca_adj = full_CA[1:] - full_CA[:-1]
         dist_ca_adj = torch.norm(diff_ca_adj, dim=1)
-        # 3.8A is ideal for trans-peptide. Cis is different. We assume Trans.
-        # NeRF sets CA(i) relative to CA(i-1) via C(i-1), N(i).
-        # The distance CA(i)-CA(i-1) is determined by the bond lengths and angles at C(i-1) and N(i) and Omega.
-        # If Omega=180, it's ~3.8.
-        loss_ca_continuity = torch.sum((dist_ca_adj - 3.8)**2) * 10.0 # Heavy penalty
-        
-        # Clash (CA-CA + CB-CB)
-        full_atoms = torch.cat([full_CA, full_CB, full_N, full_C])
-        diff_mat = full_atoms.unsqueeze(0) - full_atoms.unsqueeze(1)
-        dist_mat = torch.norm(diff_mat, dim=2)
-        mask = torch.triu(torch.ones_like(dist_mat), diagonal=2) > 0
-        clash_dists = dist_mat[mask]
-        clash_loss = torch.sum(torch.relu(3.5 - clash_dists)**2)
-        
-        # Minimal Steric Repulsion (Hard Sphere)
-        # Any non-bonded atom pair < 2.0 A is a hard clash.
-        # We apply a very steep penalty here.
-        hard_clash_mask = (dist_mat < 2.0) & mask
-        loss_hard_clash = torch.sum(hard_clash_mask.float() * 1000.0) + torch.sum(torch.relu(2.0 - dist_mat[hard_clash_mask])**2) * 500.0
+        adj_same_chain = (chain_ids[1:] == chain_ids[:-1]).float()
+        omega_adj = full_omega[:-1]
+        cis_w = (1.0 + torch.cos(omega_adj)).clamp(0.0, 1.0) * 0.5
+        ca_target = 3.8 * (1.0 - cis_w) + 2.9 * cis_w
+        loss_ca_continuity = torch.sum(((dist_ca_adj - ca_target) ** 2) * adj_same_chain) * 10.0
         
         full_O = torch.cat(all_O)
-        heavy_atoms = torch.cat([full_CA, full_CB, full_O, full_N, full_C])
-        hdiff = heavy_atoms.unsqueeze(0) - heavy_atoms.unsqueeze(1)
-        hdist = torch.norm(hdiff, dim=2)
-        hmask = torch.triu(torch.ones_like(hdist), diagonal=2) > 0
-        heavy_loss = torch.sum(torch.relu(2.6 - hdist[hmask])**2)
+        heavy_per_res = torch.stack([full_N, full_CA, full_C, full_O, full_CB], dim=1)
+        heavy_atoms = heavy_per_res.reshape(-1, 3)
+        res_ids = torch.arange(total_residues, device=device).repeat_interleave(5)
+        atom_radii = torch.tensor([1.55, 1.70, 1.70, 1.52, 1.70], device=device, dtype=heavy_atoms.dtype)
+        radii_flat = atom_radii.repeat(total_residues)
+
+        hdist = torch.cdist(heavy_atoms, heavy_atoms, p=2.0)
+        pair_mask = torch.triu(torch.ones_like(hdist, dtype=torch.bool), diagonal=1)
+        resdiff = torch.abs(res_ids.unsqueeze(0) - res_ids.unsqueeze(1))
+        pair_mask = pair_mask & (resdiff >= 2)
+
+        vdW_sum = radii_flat.unsqueeze(0) + radii_flat.unsqueeze(1)
+        soft_thr = 0.9 * vdW_sum
+        hard_thr = 0.8 * vdW_sum
+
+        soft_pen = torch.relu(soft_thr - hdist) ** 2
+        hard_pen = torch.relu(hard_thr - hdist) ** 2
+
+        heavy_loss = torch.sum(soft_pen[pair_mask])
+        loss_hard_clash = torch.sum(hard_pen[pair_mask]) * 25.0
+        clash_loss = torch.sum((hard_pen > 0.0).float()[pair_mask])
+        
+        dist_ca_pairs = torch.cdist(full_CA, full_CA, p=2.0)
+        pair_mask_ca = torch.triu(torch.ones_like(dist_ca_pairs, dtype=torch.bool), diagonal=1) & (idx_diff >= 2)
+        ca_pen = torch.relu(3.6 - dist_ca_pairs) ** 2
+        loss_ca_hard36 = torch.sum(ca_pen[pair_mask_ca])
         
         # Hydrophobic Effect
-        diff_cb = full_CB.unsqueeze(0) - full_CB.unsqueeze(1)
-        dist_cb = torch.norm(diff_cb, dim=2) + 1e-6
+        # Optimize CB distance
+        # full_CB: (N_res, 3)
+        dist_cb = torch.cdist(full_CB, full_CB, p=2.0) + 1e-6
+        diff_cb = full_CB.unsqueeze(0) - full_CB.unsqueeze(1) # Keep for vectors
+        
         u_vec = full_CB - full_CA
         u_vec = u_vec / (torch.norm(u_vec, dim=1, keepdim=True) + 1e-6)
         v_unit = (-diff_cb) / (dist_cb.unsqueeze(2))
@@ -752,13 +890,11 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         dot_j = torch.sum(u_vec.unsqueeze(0) * (-v_unit), dim=2).clamp(min=0.0)
         ori_gate = dot_i * dot_j
         hp_mat = full_hydro.unsqueeze(0) * full_hydro.unsqueeze(1)
-        mask_nonlocal = (torch.triu(torch.ones_like(dist_cb), diagonal=3) > 0).float()
         
         hp_dist_sum = torch.sum(dist_cb * hp_mat * mask_nonlocal)
         n_hp_pairs = torch.sum(hp_mat * mask_nonlocal) + 1.0
         loss_hydro = hp_dist_sum / n_hp_pairs
         
-        cross_mask = (chain_ids.unsqueeze(0) != chain_ids.unsqueeze(1)).float()
         iface_sum = torch.sum(dist_cb * hp_mat * mask_nonlocal * cross_mask * ori_gate)
         iface_pairs = torch.sum(hp_mat * mask_nonlocal * cross_mask) + 1.0
         loss_iface_hydro = iface_sum / iface_pairs
@@ -810,9 +946,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         
         diff_ca = full_CA.unsqueeze(0) - full_CA.unsqueeze(1)
         dist_ca = torch.norm(diff_ca, dim=2) + 1e-6
-        n_res = len(full_CA)
-        idx = torch.arange(n_res, device=device)
-        idx_diff = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
         near_mask = ((idx_diff > 2) & (dist_ca < 8.0)).float()
         neighbor_counts = torch.sum(near_mask, dim=1)
         exposure = 1.0 / (1.0 + neighbor_counts)
@@ -837,9 +970,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         # Biological Rule: Cysteines in oxidizing environments tend to form disulfide bridges.
         # We encourage Cys-Cys pairs to be close (~5A CB-CB) if they are reasonably near.
         # This is a soft constraint to guide formation, not a hard bond.
-        cys_mask = (full_hydro == 0.0) & (full_polar == 1.0) & (full_charge == 0.0) # Crude mask? No, rely on sequence.
-        # Better: derive from sequence explicitly
-        cys_indices = torch.nonzero(aa_indices == MJ_INDEX['C']).squeeze()
         loss_disulfide = torch.tensor(0.0, device=device)
         if cys_indices.numel() > 1:
             # Get all pairs
@@ -857,6 +987,26 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
             ss_pot = (c_dist - 4.0)**2
             loss_disulfide = torch.sum(ss_pot * ss_prox_mask) * 0.5 # 0.5 for double counting
         
+        # --- Primitive Hydrophobic Collapse & Charged Clash ---
+        # 1. Hydrophobic Collapse (I, L, V, F, M)
+        # CA-CA < 8 A: negative score
+        # CA-CA < 6 A: additional negative score
+        hp_col_mat = full_collapse_hydro.unsqueeze(0) * full_collapse_hydro.unsqueeze(1)
+        # pair_mask_ca is upper triangle and idx_diff >= 2
+        
+        d8_mask = (dist_ca_pairs < 8.0).float()
+        d6_mask = (dist_ca_pairs < 6.0).float()
+        
+        # Reward is negative energy
+        loss_hydro_collapse = -torch.sum((d8_mask + d6_mask) * hp_col_mat * pair_mask_ca.float())
+        
+        # 2. Charged Clash (D, E, K, R)
+        # < 4 A clash penalty
+        chg_clash_mat = full_charged_clash.unsqueeze(0) * full_charged_clash.unsqueeze(1)
+        d4_mask = (dist_ca_pairs < 4.0).float()
+        
+        loss_charged_clash = torch.sum(d4_mask * chg_clash_mat * pair_mask_ca.float())
+
         # Weights (Tuned for Bio-plausibility)
         w_rg = 1.5
         w_rg_tgt = 1.2
@@ -866,6 +1016,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         w_ca_cont = 5.0
         w_ss = 2.0
         w_rama = 4.0 # Boosted: Biological backbone preference is strong
+        w_omega = 3.0
         w_hb = 4.0
         w_hydro = 3.0 # Slightly reduced, rely more on burial/MJ
         w_iface_hydro = 2.5
@@ -875,16 +1026,21 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         w_lj = 0.5
         w_burial = 4.0
         w_polar = 2.0
-        w_smooth = 0.5
+        w_smooth = 0.0 # User Feedback: "Invisible wire" effect. Disable smooth path.
         w_mj = 4.0 # Boosted: Statistical potential reflects natural selection
         w_disulfide = 5.0 # Strong bias for SS bonds
+        w_ca_hard36 = 10.0
         
-        loss = (loss_ss * w_ss + loss_rama * w_rama + loss_smooth * w_smooth + loss_rg_target * w_rg_tgt + 
+        w_hydro_collapse = 2.0
+        w_charged_clash = 50.0
+        
+        loss = (loss_ss * w_ss + loss_rama * w_rama + loss_omega * w_omega + loss_smooth * w_smooth + loss_rg_target * w_rg_tgt + 
                 clash_loss * w_clash + loss_hard_clash * w_hard_clash + heavy_loss * w_heavy + loss_ca_continuity * w_ca_cont +
                 loss_hydro * w_hydro + loss_iface_hydro * w_iface_hydro + loss_mj * w_mj + 
                 loss_elec * w_elec + loss_catpi * w_catpi + loss_pipi * w_pipi + 
                 loss_lj * w_lj + loss_burial * w_burial + loss_polar * w_polar +
-                hb_energy * w_hb + loss_disulfide * w_disulfide)
+                hb_energy * w_hb + loss_disulfide * w_disulfide + loss_ca_hard36 * w_ca_hard36 +
+                loss_hydro_collapse * w_hydro_collapse + loss_charged_clash * w_charged_clash)
         
         # Universal Constraints
         loss_constraints = torch.tensor(0.0, device=device)
@@ -942,7 +1098,8 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                 except Exception:
                     pass
         
-        loss += loss_constraints
+        # Use safe addition to handle potential shape mismatches (scalar vs [1])
+        loss = loss + loss_constraints
         return loss
 
         if num_chains == 1:
@@ -976,24 +1133,38 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                       w_polar * loss_polar +
                       w_smooth * loss_smooth +
                       w_mj * loss_mj + 
+                      w_ca_hard36 * loss_ca_hard36 +
                       w_disulfide * loss_disulfide)
                       
         return total_loss
     
-    frames_dir = os.path.join(os.path.dirname(output_pdb), "_frames")
-    try:
-        os.makedirs(frames_dir, exist_ok=True)
-    except Exception:
-        pass
+    if os.environ.get("MINIFOLD_IGPU_COMPILE", "0") == "1" and hasattr(torch, "compile"):
+        try:
+            calc_loss = torch.compile(calc_loss, mode=os.environ.get("MINIFOLD_IGPU_COMPILE_MODE", "reduce-overhead"))
+        except Exception as e:
+            logger.warning(f"torch.compile unavailable: {e}")
+
+    snapshots_enabled = os.environ.get("MINIFOLD_IGPU_SNAPSHOTS", "1") == "1"
+
+    frames_dir = None
     frame_counter = 0
-    # Helper to save snapshot
+    if snapshots_enabled:
+        frames_dir = os.path.join(os.path.dirname(output_pdb), "_frames")
+        try:
+            os.makedirs(frames_dir, exist_ok=True)
+        except Exception:
+            frames_dir = None
+
     def save_snapshot(step_name):
+        if not snapshots_enabled or frames_dir is None:
+            return
         try:
             with torch.no_grad():
                 final_N_list, final_CA_list, final_C_list = [], [], []
                 for i, d in enumerate(chain_data):
                     phi, psi = phi_params[i], psi_params[i]
-                    N, CA, C, _, _, _ = build_full_structure_tensor(d["seq"], phi, psi, device)
+                    omega = omega_params[i]
+                    N, CA, C, _, _, _ = build_full_structure_tensor(len(d["seq"]), phi, psi, device, bond_constants, omega=omega)
                     if i > 0 and rb_params is not None:
                         params = rb_params[i-1]
                         t, r = params[:3], params[3:]
@@ -1008,7 +1179,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                 final_CA = torch.cat(final_CA_list).cpu().numpy()
                 final_C = torch.cat(final_C_list).cpu().numpy()
                 
-                lengths = [len(s) for s in chain_ss_list]
+                lengths = [len(d["seq"]) for d in chain_data]
                 breaks = []
                 acc = 0
                 for L in lengths[:-1]:
@@ -1017,7 +1188,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                 
                 tmp_path = output_pdb + ".tmp"
                 # Use global write_pdb
-                write_pdb(sequence, final_N, final_CA, final_C, tmp_path, chain_breaks=breaks)
+                write_pdb(used_sequence, final_N, final_CA, final_C, tmp_path, chain_breaks=breaks)
                 
                 # Atomic replace (simulated for Windows) with retry
                 max_retries = 5
@@ -1036,7 +1207,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                 frame_counter += 1
                 frame_name = f"frame_{frame_counter:05d}.pdb"
                 frame_tmp = os.path.join(frames_dir, frame_name + ".tmp")
-                write_pdb(sequence, final_N, final_CA, final_C, frame_tmp, chain_breaks=breaks)
+                write_pdb(used_sequence, final_N, final_CA, final_C, frame_tmp, chain_breaks=breaks)
                 for _ in range(max_retries):
                     try:
                         frame_out = os.path.join(frames_dir, frame_name)
@@ -1084,18 +1255,25 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
         strategies = ["bio_hydro_collapse"]
         logger.info("Fast Mode Enabled: Running 'Hydrophobic Collapse' strategy only.")
 
+    try:
+        starts_override = int(os.environ.get("MINIFOLD_IGPU_NUM_STARTS", "0"))
+    except Exception:
+        starts_override = 0
+    if starts_override > 0:
+        strategies = strategies[: max(1, min(starts_override, len(strategies)))]
+
     num_starts = len(strategies)
 
-    with torch.no_grad():
-        best_loss = None
-        best_phi = None
-        best_psi = None
-        best_rb = None
+    best_loss = None
+    best_phi = None
+    best_psi = None
+    best_omega = None
+    best_rb = None
     
     # Helper to calculate centers on the fly
-    def get_chain_props(d, p_phi, p_psi):
+    def get_chain_props(d, p_phi, p_psi, p_omega):
         # Build temp structure
-        t_N, t_CA, t_C, _, _, _ = build_full_structure_tensor(d["seq"], p_phi, p_psi, device)
+        t_N, t_CA, t_C, _, _, _ = build_full_structure_tensor(len(d["seq"]), p_phi, p_psi, device, bond_constants, omega=p_omega)
         # Geo Center
         geo_c = torch.mean(t_CA, dim=0)
         # Hydro Center
@@ -1113,55 +1291,31 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
             # 1. Initialize Angles (Phi/Psi)
             for i, d in enumerate(chain_data):
                 if strategy == "bio_rama_sampling":
-                    # Sample from Ramachandran Distributions
-                    # Use simple gaussian sampling based on RAMA_PREF
-                    new_phi = d["phi_ref"].clone()
-                    new_psi = d["psi_ref"].clone()
-                    
-                    # Apply noise based on residue type (G, P, General)
-                    for j, aa in enumerate(d["seq"]):
-                        rtype = "General"
-                        if aa == "G": rtype = "GLY"
-                        elif aa == "P": rtype = "PRO"
-                        
-                        centers = RAMA_PREF[rtype]
-                        sigmas = RAMA_SIGMA[rtype]
-                        
-                        # Pick a random center
-                        c_idx = torch.randint(0, len(centers), (1,)).item()
-                        c_phi, c_psi = centers[c_idx]
-                        
-                        # Sample
-                        # Convert ref to degrees for intuition? No, stick to radians.
-                        # Centers in RAMA_PREF are radians.
-                        
-                        # We mix the "Ideal SS" knowledge with "Rama Preference"
-                        # If SS says Helix, we prefer Helix region.
-                        # But here we just add biological noise to the SS prediction.
-                        noise_phi = torch.randn(1, device=device) * sigmas[0] * 0.5
-                        noise_psi = torch.randn(1, device=device) * sigmas[1] * 0.5
-                        
-                        new_phi[j] += noise_phi
-                        new_psi[j] += noise_psi
-                        
-                    phi_params[i].copy_(new_phi)
-                    psi_params[i].copy_(new_psi)
+                    new_phi, new_psi = ss_to_phi_psi_tensor(d["ss"], d["seq"])
+                    phi_params[i].copy_(new_phi.to(device))
+                    psi_params[i].copy_(new_psi.to(device))
                 else:
                     # Consensus / Hydrophobic: Use Ideal SS (Clean Start)
                     # Small noise to break symmetry
                     phi_params[i].copy_(d["phi_ref"] + (torch.rand_like(d["phi_ref"]) - 0.5) * 0.05)
                     psi_params[i].copy_(d["psi_ref"] + (torch.rand_like(d["psi_ref"]) - 0.5) * 0.05)
+                o0 = torch.full_like(phi_params[i], math.pi)
+                prepro_mask = d.get("prepro_mask")
+                if prepro_mask is not None and prepro_mask.numel() == o0.numel():
+                    cis_sample = (torch.rand_like(o0) < 0.05) & (prepro_mask > 0.5)
+                    o0 = torch.where(cis_sample, torch.zeros_like(o0), o0)
+                omega_params[i].copy_(o0)
 
             # 2. Initialize Rigid Body (Multi-chain)
             if rb_params is not None:
                 init_rb = []
                 # First chain (idx 0) is fixed at origin.
                 # Calculate its props.
-                c0_geo, c0_hydro = get_chain_props(chain_data[0], phi_params[0], psi_params[0])
+                c0_geo, c0_hydro = get_chain_props(chain_data[0], phi_params[0], psi_params[0], omega_params[0])
                 
                 for k in range(1, len(chain_data)):
                     # Calculate current chain props at origin
-                    ck_geo, ck_hydro = get_chain_props(chain_data[k], phi_params[k], psi_params[k])
+                    ck_geo, ck_hydro = get_chain_props(chain_data[k], phi_params[k], psi_params[k], omega_params[k])
                     
                     if strategy == "bio_hydro_collapse":
                         # Align Hydrophobic Centers
@@ -1192,27 +1346,88 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                         
                 rb_params.copy_(torch.stack(init_rb))
 
-        logger.info(f"  > Start {s+1}/{num_starts}: Adam")
-        opt_adam = torch.optim.Adam(all_params, lr=0.05)
-        for step in range(50): # Reduced from 60
-            opt_adam.zero_grad()
-            loss = calc_loss()
+        logger.info(f"  > Start {s+1}/{num_starts}: AdamW (Coarse Folding)")
+        # Use AdamW for better weight decay handling and convergence stability
+        # Use foreach=True for faster parameter updates (fused kernel)
+        opt_adam = torch.optim.AdamW(all_params, lr=0.05, weight_decay=1e-4, foreach=True)
+        
+        # IPEX Optimizer Fuse (if applicable)
+        if use_ipex and ipex_mod is not None:
+            try:
+                opt_adam, _ = ipex_mod.optimize(opt_adam, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float32, inplace=True)
+                logger.info("  > IPEX Fused Optimizer enabled")
+            except Exception:
+                pass
+
+        try:
+            adam_steps = int(os.environ.get("MINIFOLD_IGPU_ADAM_STEPS", "50"))
+        except Exception:
+            adam_steps = 150
+        adam_steps = max(1, adam_steps)
+        try:
+            log_every = int(os.environ.get("MINIFOLD_IGPU_LOG_EVERY", "5"))
+        except Exception:
+            log_every = 5
+
+        # Phase 1: Fast Coarse Folding (AdamW)
+        for step in range(adam_steps): 
+            opt_adam.zero_grad(set_to_none=True)
+            
+            # AMP Context for Intel XPU / CUDA
+            # DML support for AMP is experimental, so we skip it there for now
+            if use_ipex:
+                with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float16):
+                    loss = calc_loss()
+            elif device.type == 'cuda':
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    loss = calc_loss()
+            else:
+                loss = calc_loss()
+                
             loss.backward()
             opt_adam.step()
-            if step % 25 == 0 or step == 49: # Snapshot every 25 steps and last
+            
+            if log_every > 0 and (step + 1) % log_every == 0:
+                 logger.info(f"[PROGRESS_DETAIL] Phase 1 (Coarse): Step {step+1}/{adam_steps} | Loss: {loss.item():.2f}")
+
+            # Optimization: Skip intermediate snapshots to reduce I/O overhead
+            if step == adam_steps - 1: 
                 save_snapshot(f"adam_{s+1}_{step+1}")
-        logger.info(f"  > Start {s+1}/{num_starts}: LBFGS")
-        opt_lbfgs = torch.optim.LBFGS(all_params, max_iter=60, tolerance_grad=1e-5, tolerance_change=1e-5, history_size=20, line_search_fn="strong_wolfe") # Reduced from 80
+                
+        # Phase 2: Fine Refinement (LBFGS)
+        # Only run LBFGS if loss is reasonably low or as final polish
+        logger.info(f"  > Start {s+1}/{num_starts}: LBFGS (Fine Tuning)")
+        try:
+            lbfgs_max_iter = int(os.environ.get("MINIFOLD_IGPU_LBFGS_MAX_ITER", "40"))
+        except Exception:
+            lbfgs_max_iter = 480
+        lbfgs_max_iter = max(1, lbfgs_max_iter)
+
+        opt_lbfgs = torch.optim.LBFGS(all_params, max_iter=lbfgs_max_iter, tolerance_grad=1e-5, tolerance_change=1e-5, history_size=10, line_search_fn="strong_wolfe")
+        
         lbfgs_step_count = 0
+        amp_lbfgs = os.environ.get("MINIFOLD_IGPU_AMP_LBFGS", "0") == "1"
         def closure():
             nonlocal lbfgs_step_count
-            opt_lbfgs.zero_grad()
-            l = calc_loss()
+            opt_lbfgs.zero_grad(set_to_none=True)
+            if amp_lbfgs and use_ipex:
+                with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float16):
+                    l = calc_loss()
+            elif amp_lbfgs and device.type == 'cuda':
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    l = calc_loss()
+            else:
+                l = calc_loss()
             l.backward()
             lbfgs_step_count += 1
-            if lbfgs_step_count % 25 == 0: # Snapshot every 25 evaluations
+            # Optimization: Only snapshot at the end or very rarely
+            if log_every > 0 and lbfgs_step_count % log_every == 0:
+                 logger.info(f"[PROGRESS_DETAIL] Phase 2 (Fine): Step {lbfgs_step_count} | Loss: {l.item():.2f}")
+            
+            if lbfgs_step_count % 40 == 0: 
                 save_snapshot(f"lbfgs_{s+1}_{lbfgs_step_count}")
             return l
+            
         try:
             opt_lbfgs.step(closure)
         except Exception as e:
@@ -1223,12 +1438,14 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                 best_loss = cur_loss
                 best_phi = [p.detach().clone() for p in phi_params]
                 best_psi = [q.detach().clone() for q in psi_params]
+                best_omega = [o.detach().clone() for o in omega_params]
                 best_rb = rb_params.detach().clone() if rb_params is not None else None
     with torch.no_grad():
-        if best_phi is not None and best_psi is not None:
+        if best_phi is not None and best_psi is not None and best_omega is not None:
             for i in range(len(phi_params)):
                 phi_params[i].copy_(best_phi[i])
                 psi_params[i].copy_(best_psi[i])
+                omega_params[i].copy_(best_omega[i])
         if rb_params is not None and best_rb is not None:
             rb_params.copy_(best_rb)
         
@@ -1236,12 +1453,14 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
     final_N_list = []
     final_CA_list = []
     final_C_list = []
+    final_CB_list = []
     
     with torch.no_grad():
         for i, d in enumerate(chain_data):
             phi = phi_params[i]
             psi = psi_params[i]
-            N, CA, C, _, _, _ = build_full_structure_tensor(d["seq"], phi, psi, device)
+            omega = omega_params[i]
+            N, CA, C, _, _, CB = build_full_structure_tensor(len(d["seq"]), phi, psi, device, bond_constants, omega=omega)
             
             if i > 0 and rb_params is not None:
                 params = rb_params[i-1]
@@ -1249,20 +1468,23 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
                 N = _apply_transform_tensor(N, t, r, device)
                 CA = _apply_transform_tensor(CA, t, r, device)
                 C = _apply_transform_tensor(C, t, r, device)
+                CB = _apply_transform_tensor(CB, t, r, device)
                 
             final_N_list.append(N)
             final_CA_list.append(CA)
             final_C_list.append(C)
+            final_CB_list.append(CB)
             
     final_N = torch.cat(final_N_list).cpu().numpy()
     final_CA = torch.cat(final_CA_list).cpu().numpy()
     final_C = torch.cat(final_C_list).cpu().numpy()
+    final_CB = torch.cat(final_CB_list).cpu().numpy()
     
     elapsed = time.time() - start_time
     logger.info(f"iGPU Optimization completed in {elapsed:.4f}s [{ALGO_VERSION}]")
     
     # Breaks
-    lengths = [len(s) for s in chain_ss_list]
+    lengths = [len(d["seq"]) for d in chain_data]
     breaks = []
     acc = 0
     for L in lengths[:-1]:
@@ -1276,17 +1498,17 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None):
             phi_all.extend(list(phi_params[i].detach().cpu().numpy()))
             psi_all.extend(list(psi_params[i].detach().cpu().numpy()))
         mj_mat = np.array(MJ_VALUES, dtype=float)
-        rp = rama_pass_rate(phi_all, psi_all, sequence)
-        ce = contact_energy(final_CA, final_CA, sequence, mj_mat)
+        rp = rama_pass_rate(phi_all, psi_all, used_sequence)
+        ce = contact_energy(final_CA, final_CB, used_sequence, mj_mat)
         tm = tm_score_proxy(final_CA)
         remarks = {"RAMA_PASS_RATE": f"{rp:.3f}", "CONTACT_ENERGY": f"{ce:.3f}", "TM_SCORE_PROXY": f"{tm:.3f}"}
         out_json = os.path.splitext(output_pdb)[0] + ".metrics.json"
         write_results_json(out_json, {"ramachandran_pass_rate": rp, "contact_energy": ce, "tm_score_proxy": tm, "elapsed_seconds": elapsed})
     except Exception:
         remarks = None
-    ok = write_pdb(sequence, final_N, final_CA, final_C, output_pdb, chain_breaks=breaks, remarks=remarks)
+    ok = write_pdb(used_sequence, final_N, final_CA, final_C, output_pdb, chain_breaks=breaks, remarks=remarks)
     try:
-        if os.path.exists(frames_dir):
+        if frames_dir is not None and os.path.exists(frames_dir):
             shutil.rmtree(frames_dir, ignore_errors=True)
     except Exception:
         pass
@@ -1345,31 +1567,34 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None, remarks=None):
             f.write(f"ATOM  {atom_idx:5d}  C   {resn:>3s} {chain_id}{res_idx:4d}    {C[i][0]:8.3f}{C[i][1]:8.3f}{C[i][2]:8.3f}  1.00  0.00           C\n")
             atom_idx += 1
             
-            # Re-calculate O for PDB (based on final coords)
-            # Use place_atom logic locally or simplified
             try:
-                # O vector: bisect N-CA-C angle approx?
-                # or place relative to C using CA, N
-                v_ca_c = C[i] - CA[i]
-                v_ca_c /= np.linalg.norm(v_ca_c)
-                v_n_ca = CA[i] - N[i]
-                v_n_ca /= np.linalg.norm(v_n_ca)
-                
-                # In plane defined by N, CA, C
-                # O is ~opposite to bisector
-                # Simple: rotate v_ca_c by 120 deg in plane
-                n_plane = np.cross(v_n_ca, v_ca_c)
-                n_plane /= np.linalg.norm(n_plane)
-                
-                # Rodrigues
-                theta = math.radians(120.0)
-                v_o = v_ca_c * math.cos(theta) + np.cross(n_plane, v_ca_c) * math.sin(theta) + n_plane * np.dot(n_plane, v_ca_c) * (1 - math.cos(theta))
-                O_pos = C[i] + 1.23 * v_o
-                
+                if (i + 1) < len(sequence) and (i + 1) < next_break:
+                    Nnext = N[i + 1]
+                else:
+                    Nnext = N[i]
+                v1 = CA[i] - C[i]
+                v2 = Nnext - C[i]
+                u1 = v1 / (np.linalg.norm(v1) + 1e-9)
+                u2 = v2 / (np.linalg.norm(v2) + 1e-9)
+                d = -(u1 + u2)
+                dn = np.linalg.norm(d)
+                if dn > 1e-6:
+                    d = d / (dn + 1e-9)
+                else:
+                    d = -u1
+                O_pos = C[i] + 1.229 * d
+                v1p = CA[i] - N[i]
+                v2p = C[i] - CA[i]
+                nrm = np.cross(v1p, v2p)
+                nl = np.linalg.norm(nrm)
+                if nl > 1e-6:
+                    nrm = nrm / nl
+                    dproj = np.dot(O_pos - N[i], nrm)
+                    O_pos = O_pos - dproj * nrm
                 f.write(f"ATOM  {atom_idx:5d}  O   {resn:>3s} {chain_id}{res_idx:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O\n")
                 atom_idx += 1
                 env_atoms.append(O_pos)
-            except:
+            except Exception:
                 pass
             
             # Sidechain
@@ -1400,9 +1625,9 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None, remarks=None):
     return True
 
 # Interface compatibility wrapper
-def run_backbone_fold_multichain(sequence, chain_ss_list, output_pdb, chain_slices=None):
+def run_backbone_fold_multichain(sequence, chain_ss_list, output_pdb, chain_slices=None, constraints=None, backend="auto"):
     try:
-        return optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb)
+        return optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=constraints, backend=backend)
     except Exception as e:
         logger.error(f"iGPU Optimization failed: {e}. Falling back to standard predictor.")
         return False

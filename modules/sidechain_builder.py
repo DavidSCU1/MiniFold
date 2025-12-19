@@ -61,7 +61,62 @@ except Exception:
 # Compatibility alias for single-rotamer usage
 ROTAMERS = {k: v[0] for k, v in ROTAMER_LIBRARY.items()}
 
-def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=None):
+def _wrap_deg(x):
+    return (x + 180.0) % 360.0 - 180.0
+
+def _circ_diff_deg(a, b):
+    d = _wrap_deg(a - b)
+    return abs(d)
+
+def _nearest_chi1_state(chi1_deg):
+    x = _wrap_deg(float(chi1_deg))
+    if x <= -150.0:
+        x = 180.0
+    states = (-60.0, 60.0, 180.0)
+    best = states[0]
+    best_d = _circ_diff_deg(x, best)
+    for s in states[1:]:
+        d = _circ_diff_deg(x, s)
+        if d < best_d:
+            best = s
+            best_d = d
+    return best
+
+def _sample_rotamer_by_chi1(res_name, options):
+    if not options or len(options) == 1:
+        return options[0] if options else []
+    if res_name in ("ALA", "GLY", "PRO"):
+        return options[0]
+
+    pref = {
+        "LEU": (0.45, 0.45, 0.10),
+        "ILE": (0.45, 0.45, 0.10),
+        "VAL": (0.45, 0.45, 0.10),
+        "PHE": (0.20, 0.20, 0.60),
+        "TYR": (0.20, 0.20, 0.60),
+        "TRP": (0.20, 0.20, 0.60),
+        "HIS": (0.20, 0.20, 0.60),
+    }.get(res_name, (0.34, 0.33, 0.33))
+
+    r = np.random.rand()
+    if r < pref[0]:
+        target = -60.0
+    elif r < pref[0] + pref[1]:
+        target = 60.0
+    else:
+        target = 180.0
+
+    filtered = []
+    for rot in options:
+        if not rot:
+            continue
+        if _nearest_chi1_state(rot[0]) == target:
+            filtered.append(rot)
+    if not filtered:
+        filtered = options
+    return filtered[int(np.random.randint(0, len(filtered)))]
+
+def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=None, forced_chi1=None, forced_chi2=None):
     """
     Selects the best rotamer from the library by checking for clashes.
     Currently checks self-consistency and simple steric clash if env provided.
@@ -75,10 +130,36 @@ def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=
     }
     res_name = three_letter.get(aa_code, "ALA")
     options = ROTAMER_LIBRARY.get(res_name, [[]])
+    base = options[0] if options and options[0] else []
+    chi1_options = []
+    if base:
+        for s in (-60.0, 60.0, 180.0):
+            chi1_options.append([s] + base[1:])
+    options = chi1_options if chi1_options else options
     
-    if (local_environment_atoms is None
-        or (isinstance(local_environment_atoms, np.ndarray) and local_environment_atoms.size == 0)
-        or len(options) == 1):
+    if forced_chi1 is not None:
+        try:
+            target = _nearest_chi1_state(forced_chi1)
+            filtered = []
+            for rot in options:
+                if not rot:
+                    continue
+                if _nearest_chi1_state(rot[0]) == target:
+                    r = rot[:]
+                    if forced_chi2 is not None and len(r) > 1:
+                        r[1] = float(forced_chi2)
+                    filtered.append(r)
+            if filtered:
+                options = filtered
+        except Exception:
+            pass
+    if local_environment_atoms is None or (isinstance(local_environment_atoms, np.ndarray) and local_environment_atoms.size == 0):
+        rot = _sample_rotamer_by_chi1(res_name, options)
+        if forced_chi2 is not None and rot and len(rot) > 1:
+            rot = rot[:]
+            rot[1] = float(forced_chi2)
+        return build_sidechain(aa_code, n_coord, ca_coord, c_coord, rot)
+    if len(options) == 1:
         return build_sidechain(aa_code, n_coord, ca_coord, c_coord, options[0])
         
     best_atoms = None
@@ -202,6 +283,148 @@ def place_atom_nerf(a, b, c, bond_len, bond_angle, torsion):
     
     return c + M @ d_local
 
+def _normalize(v):
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return v
+    return v / n
+
+def _rotate_around_axis(v, axis, angle):
+    axis = _normalize(axis)
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return v * c + np.cross(axis, v) * s + axis * (np.dot(axis, v)) * (1.0 - c)
+
+def _orthonormal_frame(axis1, ref):
+    a1 = _normalize(axis1)
+    r = ref - np.dot(ref, a1) * a1
+    if np.linalg.norm(r) < 1e-9:
+        if abs(a1[0]) < 0.9:
+            r = np.array([1.0, 0.0, 0.0])
+        else:
+            r = np.array([0.0, 1.0, 0.0])
+        r = r - np.dot(r, a1) * a1
+    a2 = _normalize(r)
+    a3 = _normalize(np.cross(a1, a2))
+    a2 = _normalize(np.cross(a3, a1))
+    return a1, a2, a3
+
+def _rotate_plane_axes(axis1, axis2, axis3, angle):
+    c = math.cos(angle)
+    s = math.sin(angle)
+    a2 = axis2 * c + axis3 * s
+    a3 = -axis2 * s + axis3 * c
+    return axis1, a2, a3
+
+def _place_planar_template(origin, axis2, axis3, coords_2d):
+    out = {}
+    for k, (x, y) in coords_2d.items():
+        out[k] = origin + axis2 * float(x) + axis3 * float(y)
+    return out
+
+def _his_template_2d():
+    s = 1.37
+    R = s / (2.0 * math.sin(math.pi / 5.0))
+    ang = [0.0, 2.0 * math.pi / 5.0, 4.0 * math.pi / 5.0, 6.0 * math.pi / 5.0, 8.0 * math.pi / 5.0]
+    verts = [(R * math.cos(a), R * math.sin(a)) for a in ang]
+    v0x, v0y = verts[0]
+    rel = [(x - v0x, y - v0y) for (x, y) in verts]
+    return {
+        "ND1": rel[1],
+        "CE1": rel[2],
+        "NE2": rel[3],
+        "CD2": rel[4],
+    }
+
+_TRP_TEMPLATE_2D = {
+    "CD1": (-1.35, 1.20),
+    "NE1": (-2.55, 0.50),
+    "CE2": (-1.90, -0.75),
+    "CD2": (-0.55, -0.60),
+    "CE3": (0.45, -1.55),
+    "CZ3": (1.75, -1.05),
+    "CH2": (2.05, 0.25),
+    "CZ2": (0.85, 0.95),
+}
+
+def _build_his_ring(n_coord, ca_coord, cb_coord, chi1, chi2):
+    atoms = {"CB": cb_coord}
+    cg = place_atom_nerf(n_coord, ca_coord, cb_coord, 1.50, math.radians(110.5), chi1)
+    atoms["CG"] = cg
+    axis1 = cg - cb_coord
+    ref = ca_coord - cb_coord
+    a1, a2, a3 = _orthonormal_frame(axis1, ref)
+    _, a2r, a3r = _rotate_plane_axes(a1, a2, a3, chi2)
+    atoms.update(_place_planar_template(cg, a2r, a3r, _his_template_2d()))
+    return atoms
+
+def _build_trp_ring(n_coord, ca_coord, cb_coord, chi1, chi2):
+    atoms = {"CB": cb_coord}
+    cg = place_atom_nerf(n_coord, ca_coord, cb_coord, 1.50, math.radians(110.5), chi1)
+    atoms["CG"] = cg
+    axis1 = cg - cb_coord
+    ref = ca_coord - cb_coord
+    a1, a2, a3 = _orthonormal_frame(axis1, ref)
+    _, a2r, a3r = _rotate_plane_axes(a1, a2, a3, chi2)
+    atoms.update(_place_planar_template(cg, a2r, a3r, _TRP_TEMPLATE_2D))
+    return atoms
+
+def _build_phe_tyr_ring(res_name, n_coord, ca_coord, c_coord, cb_coord, chi1, chi2):
+    atoms = {"CB": cb_coord}
+    cg_coord = place_atom_nerf(n_coord, ca_coord, cb_coord, 1.50, math.radians(110.5), chi1)
+    atoms["CG"] = cg_coord
+
+    cd1 = place_atom_nerf(ca_coord, cb_coord, cg_coord, 1.39, math.radians(120.0), chi2)
+    cd2 = place_atom_nerf(ca_coord, cb_coord, cg_coord, 1.39, math.radians(120.0), chi2 + math.pi)
+    atoms["CD1"] = cd1
+    atoms["CD2"] = cd2
+
+    nrm = np.cross(cd1 - cg_coord, cd2 - cg_coord)
+    if np.linalg.norm(nrm) < 1e-6:
+        nrm = np.cross(cb_coord - cg_coord, cd1 - cg_coord)
+    nrm = _normalize(nrm)
+
+    u1 = _normalize(cg_coord - cd1)
+    u2 = _normalize(cg_coord - cd2)
+    e1a = _normalize(_rotate_around_axis(u1, nrm, 2.0 * math.pi / 3.0))
+    e1b = _normalize(_rotate_around_axis(u1, nrm, -2.0 * math.pi / 3.0))
+    ce1 = cd1 + 1.39 * (e1a if np.linalg.norm((cd2 - (cd1 + 1.39 * e1a))) > np.linalg.norm((cd2 - (cd1 + 1.39 * e1b))) else e1b)
+
+    e2a = _normalize(_rotate_around_axis(u2, nrm, 2.0 * math.pi / 3.0))
+    e2b = _normalize(_rotate_around_axis(u2, nrm, -2.0 * math.pi / 3.0))
+    ce2 = cd2 + 1.39 * (e2a if np.linalg.norm((cd1 - (cd2 + 1.39 * e2a))) > np.linalg.norm((cd1 - (cd2 + 1.39 * e2b))) else e2b)
+
+    atoms["CE1"] = ce1
+    atoms["CE2"] = ce2
+
+    u3 = _normalize(cd1 - ce1)
+    cz_a = ce1 + 1.39 * _normalize(_rotate_around_axis(u3, nrm, 2.0 * math.pi / 3.0))
+    cz_b = ce1 + 1.39 * _normalize(_rotate_around_axis(u3, nrm, -2.0 * math.pi / 3.0))
+    cz = cz_a if np.linalg.norm(cz_a - ce2) < np.linalg.norm(cz_b - ce2) else cz_b
+    atoms["CZ"] = cz
+
+    if res_name == "TYR":
+        out_dir = _normalize(-((ce1 - cz) + (ce2 - cz)))
+        oh = cz + 1.37 * out_dir
+        atoms["OH"] = oh
+    return atoms
+
+def _project_atoms_to_plane(atoms, anchor_names):
+    pts = [atoms.get(n) for n in anchor_names if n in atoms]
+    if len(pts) < 3:
+        return atoms
+    p0, p1, p2 = pts[0], pts[1], pts[2]
+    nrm = np.cross(p1 - p0, p2 - p0)
+    if np.linalg.norm(nrm) < 1e-6:
+        return atoms
+    nrm = _normalize(nrm)
+    for k, v in list(atoms.items()):
+        if v is None:
+            continue
+        d = np.dot(v - p0, nrm)
+        atoms[k] = v - d * nrm
+    return atoms
+
 def build_sidechain(aa_code, n_coord, ca_coord, c_coord, chi_angles=None):
     """
     Builds sidechain atoms for a given amino acid.
@@ -289,18 +512,29 @@ def build_sidechain(aa_code, n_coord, ca_coord, c_coord, chi_angles=None):
     cb_vec = -0.5366 * u_ca_n - 0.5366 * u_ca_c - 0.6517 * n_plane
     cb_coord = ca_coord + 1.53 * (cb_vec / np.linalg.norm(cb_vec))
     atoms['CB'] = cb_coord
+
+    if not chi_angles:
+        chi_angles = ROTAMERS.get(res_name, [])
+    chis = [math.radians(x) for x in chi_angles]
+    if res_name in ("PHE", "TYR"):
+        chi1 = chis[0] if len(chis) > 0 else math.radians(-60.0)
+        chi2 = chis[1] if len(chis) > 1 else math.radians(90.0)
+        atoms.update(_build_phe_tyr_ring(res_name, n_coord, ca_coord, c_coord, cb_coord, chi1, chi2))
+        return atoms
+    if res_name == "HIS":
+        chi1 = chis[0] if len(chis) > 0 else math.radians(-60.0)
+        chi2 = chis[1] if len(chis) > 1 else math.radians(90.0)
+        return _build_his_ring(n_coord, ca_coord, cb_coord, chi1, chi2)
+    if res_name == "TRP":
+        chi1 = chis[0] if len(chis) > 0 else math.radians(-60.0)
+        chi2 = chis[1] if len(chis) > 1 else math.radians(90.0)
+        return _build_trp_ring(n_coord, ca_coord, cb_coord, chi1, chi2)
     
     if res_name == "ALA":
         return atoms
         
     # 2. Build remaining atoms using NeRF and Chi angles
     # Start chain: N -> CA -> CB -> ...
-    
-    if not chi_angles:
-        chi_angles = ROTAMERS.get(res_name, [])
-        
-    # Convert degrees to radians
-    chis = [math.radians(x) for x in chi_angles]
     
     current_chis = 0
     
@@ -432,5 +666,11 @@ def build_sidechain(aa_code, n_coord, ca_coord, c_coord, chi_angles=None):
         new_coord = place_atom_nerf(a, b, c, length, angle, torsion)
         atoms[atom_name] = new_coord
         coords[atom_name] = new_coord
-        
+
+    if res_name in ("TRP", "HIS"):
+        if res_name == "TRP":
+            _project_atoms_to_plane(atoms, ["CG", "CD1", "CD2"])
+        else:
+            _project_atoms_to_plane(atoms, ["CG", "ND1", "CD2"])
+
     return atoms

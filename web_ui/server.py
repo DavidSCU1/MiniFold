@@ -98,6 +98,7 @@ class AppState:
         self.current_process = None
         self.progress = 0
         self.current_step = ""
+        self.detail_progress = ""  # New field for granular progress
         self.start_time = None
         self.lock = threading.Lock()
         self.output_dir_rel = "output"
@@ -112,16 +113,19 @@ class AppState:
             if len(self.logs) > 1000:
                 self.logs.pop(0)
 
-    def update_progress(self, percent, step):
+    def update_progress(self, percent, step, detail=None):
         with self.lock:
             self.progress = percent
             self.current_step = step
+            if detail is not None:
+                self.detail_progress = detail
 
     def clear_logs(self):
         with self.lock:
             self.logs = []
             self.progress = 0
             self.current_step = ""
+            self.detail_progress = ""
             self.start_time = None
 
     def set_status(self, status):
@@ -409,6 +413,7 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
             "logs": state.logs,
             "progress": state.progress,
             "current_step": state.current_step,
+            "detail_progress": state.detail_progress,
             "elapsed_time": elapsed,
             "latest_pdb": latest_pdb,
             "latest_pdb_mtime": latest_pdb_mtime,
@@ -601,6 +606,11 @@ def run_minifold(data):
     state.add_log("Starting MiniFold...", "INFO")
 
     try:
+        try:
+            from modules.env_loader import load_env
+            load_env(os.path.join(PROJECT_ROOT, ".env"))
+        except Exception:
+            pass
         # Prepare arguments
         job_name = data.get("jobName", f"job_{int(time.time())}")
         fasta_content = data.get("fasta", "")
@@ -638,6 +648,15 @@ def run_minifold(data):
                 except:
                     pass
             
+            # PARSE DETAILED PROGRESS (Optimization Steps)
+            # Format: [PROGRESS_DETAIL] Phase 1 (Coarse): Step 5/50 | Loss: 204.3
+            elif "[PROGRESS_DETAIL]" in text:
+                try:
+                    detail = text.split("[PROGRESS_DETAIL]")[-1].strip()
+                    state.update_progress(state.progress, state.current_step, detail=detail)
+                except:
+                    pass
+
             # Fallback heuristic for other logs (optional, but [PROGRESS] tag is preferred)
             elif "读取 FASTA" in text or "Loaded FASTA" in text:
                 state.update_progress(5, "Loaded FASTA sequences")
@@ -671,10 +690,20 @@ def run_minifold(data):
                 
             if bool(data.get("useIgpu")):
                 cmd_args.append("--igpu")
+                # Add backend argument if present
+                backend = data.get("backend", "auto")
+                if backend and backend != "auto":
+                    cmd_args.extend(["--backend", backend])
+                    
                 # If running minifold.py externally, we pass igpu-env to it, 
                 # and it will handle the iGPU runner subprocess.
                 if bool(data.get("useIgpuEnv") and data.get("igpuEnvName")):
                     cmd_args.extend(["--igpu-env", data.get("igpuEnvName")])
+            
+            if bool(data.get("useNpu")):
+                cmd_args.append("--npu")
+                if bool(data.get("useNpuEnv") and data.get("npuEnvName")):
+                    cmd_args.extend(["--npu-env", data.get("npuEnvName")])
             
             # Pass target chains if present
             target_chains_val = data.get("targetChains")
@@ -758,10 +787,22 @@ def run_minifold(data):
             # Execute pipeline in-process (Original Logic)
             try:
                 ensure_local_modules_package()
+                # Force reload modules to ensure latest code changes apply without server restart
+                use_ext_env = bool(data.get("useIgpuEnv") and data.get("igpuEnvName"))
+                use_igpu = bool(data.get("useIgpu"))
+                use_npu = bool(data.get("useNpu"))
+                use_npu_ext_env = bool(data.get("useNpuEnv") and data.get("npuEnvName"))
+                import modules.pipeline
+                import modules.input_handler
+                importlib.reload(modules.input_handler)
+                if use_igpu and not use_ext_env:
+                    import modules.igpu_predictor
+                    importlib.reload(modules.igpu_predictor)
+                importlib.reload(modules.pipeline)
+                
                 from modules.pipeline import run_pipeline
                 from modules.env_loader import load_env
                 load_env(os.path.join(PROJECT_ROOT, ".env"))
-                use_ext_env = bool(data.get("useIgpuEnv") and data.get("igpuEnvName"))
                 target_chains_val = data.get("targetChains")
                 try:
                     if target_chains_val:
@@ -777,11 +818,15 @@ def run_minifold(data):
                     data.get("envText"),
                     int(data.get("ssn", 5)),
                     float(data.get("threshold", 0.5)),
-                    bool(data.get("useIgpu")),
+                    use_igpu,
                     use_ext_env,
                     data.get("igpuEnvName") if use_ext_env else None,
                     target_chains=target_chains_val,
-                    log_callback=logger
+                    backend=data.get("backend", "auto"),
+                    log_callback=logger,
+                    use_npu=use_npu,
+                    use_npu_ext_env=use_npu_ext_env,
+                    npu_ext_env_name=(data.get("npuEnvName") if use_npu_ext_env else None)
                 )
                 state.set_status("completed")
                 state.update_progress(100, "Completed")

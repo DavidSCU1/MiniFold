@@ -140,12 +140,38 @@
                                 <input type="checkbox" id="useIgpu" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
                             </div>
                             <div id="igpuEnvConfig" class="hidden space-y-2 border-t border-gray-200 pt-2 mt-2">
-                                <div class="flex items-center gap-2">
+                                <div class="space-y-1 pb-2 border-b border-gray-100">
+                                    <label class="block text-xs font-medium text-gray-700">Acceleration Backend</label>
+                                    <select id="backend" class="w-full px-2 py-1.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs bg-white">
+                                        <option value="auto" selected>Auto (Best Available)</option>
+                                        <option value="directml">DirectML (Cross-Platform)</option>
+                                        <option value="ipex">Intel IPEX (XPU)</option>
+                                        <option value="oneapi_cpu">Intel oneAPI CPU</option>
+                                        <option value="cuda">NVIDIA CUDA</option>
+                                        <option value="cpu">CPU (Slow)</option>
+                                    </select>
+                                </div>
+                                <div class="flex items-center gap-2 pt-1">
                                     <input type="checkbox" id="useIgpuEnv" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500" checked>
                                     <label class="text-xs text-gray-600">Use Separate Environment for iGPU</label>
                                 </div>
                                 <div id="igpuEnvInput" class="space-y-1">
                                     <input type="text" id="igpuEnvName" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="iGPU Conda env name (e.g. MiniFold_NPU)">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-3">
+                            <div class="flex items-center justify-between">
+                                <label class="text-sm font-medium text-gray-700">NPU Acceleration (Fixed Heads)</label>
+                                <input type="checkbox" id="useNpu" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                            </div>
+                            <div id="npuEnvConfig" class="hidden space-y-2 border-t border-gray-200 pt-2 mt-2">
+                                <div class="flex items-center gap-2 pt-1">
+                                    <input type="checkbox" id="useNpuEnv" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500" checked>
+                                    <label class="text-xs text-gray-600">Use Separate Environment for NPU</label>
+                                </div>
+                                <div id="npuEnvInput" class="space-y-1">
+                                    <input type="text" id="npuEnvName" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="NPU Conda env name (e.g. MiniFold_NPU)">
                                 </div>
                             </div>
                         </div>
@@ -180,7 +206,10 @@
             <div id="progressSection" class="px-6 pt-6 pb-0 hidden">
                 <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
                     <div class="flex justify-between items-center mb-2">
-                        <span id="progressStep" class="text-sm font-semibold text-gray-700">Initializing...</span>
+                        <div class="flex flex-col">
+                             <span id="progressStep" class="text-sm font-semibold text-gray-700">Initializing...</span>
+                             <span id="progressDetail" class="text-xs text-gray-500 font-mono mt-0.5 hidden">Waiting...</span>
+                        </div>
                         <span id="progressPercent" class="text-sm font-bold text-blue-600">0%</span>
                     </div>
                     <div class="w-full bg-gray-200 rounded-full h-2.5 mb-2">
@@ -349,6 +378,14 @@
             const input = document.getElementById('igpuEnvInput');
             e.target.checked ? input.classList.remove('hidden') : input.classList.add('hidden');
         });
+        document.getElementById('useNpu').addEventListener('change', (e) => {
+            const config = document.getElementById('npuEnvConfig');
+            e.target.checked ? config.classList.remove('hidden') : config.classList.add('hidden');
+        });
+        document.getElementById('useNpuEnv').addEventListener('change', (e) => {
+            const input = document.getElementById('npuEnvInput');
+            e.target.checked ? input.classList.remove('hidden') : input.classList.add('hidden');
+        });
 
         // Run Job
         // Logic moved to startJobHandler
@@ -406,6 +443,14 @@
                     document.getElementById('progressBar').style.width = `${percent}%`;
                     document.getElementById('progressPercent').textContent = `${percent}%`;
                     document.getElementById('progressStep').textContent = data.current_step || "Processing...";
+                    
+                    const detailEl = document.getElementById('progressDetail');
+                    if (data.detail_progress) {
+                        detailEl.textContent = data.detail_progress;
+                        detailEl.classList.remove('hidden');
+                    } else {
+                        detailEl.classList.add('hidden');
+                    }
                     
                     const elapsed = data.elapsed_time || 0;
                     document.getElementById('elapsedTime').textContent = formatTime(elapsed);
@@ -749,8 +794,12 @@
                 globalEnvName: document.getElementById('globalEnvName').value.trim(),
                 
                 useIgpu: document.getElementById('useIgpu').checked,
+                backend: document.getElementById('backend').value,
                 useIgpuEnv: document.getElementById('useIgpuEnv').checked,
-                igpuEnvName: document.getElementById('igpuEnvName').value.trim()
+                igpuEnvName: document.getElementById('igpuEnvName').value.trim(),
+                useNpu: document.getElementById('useNpu').checked,
+                useNpuEnv: document.getElementById('useNpuEnv').checked,
+                npuEnvName: document.getElementById('npuEnvName').value.trim()
             };
 
             if (!data.fasta) {

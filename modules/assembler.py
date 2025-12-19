@@ -179,7 +179,7 @@ def assemble_chains(chains, verbose=False):
 
 from modules.sidechain_builder import pack_sidechain
 
-def write_complex_pdb(chains, original_sequence, out_path):
+def write_complex_pdb(chains, original_sequence, out_path, remark_lines=None):
     """
     Writes the assembled chains to a PDB file with full atom details.
     """
@@ -203,13 +203,32 @@ def write_complex_pdb(chains, original_sequence, out_path):
     }
     
     lines = []
+    if remark_lines:
+        for line in remark_lines:
+            s = str(line).rstrip("\r\n")
+            if s:
+                lines.append(s)
     serial = 1
     rid = 1
     
     seq_ptr = 0
-    
-    # Import math for O placement if needed, or rely on numpy
-    import math
+
+    def _normalize(v):
+        n = np.linalg.norm(v)
+        if n < 1e-9:
+            return None
+        return v / n
+
+    def _carbonyl_O(Ci, CAi, Nnext, bond_len=1.229):
+        u1 = _normalize(CAi - Ci)
+        u2 = _normalize(Nnext - Ci)
+        if u1 is None or u2 is None:
+            return None
+        d = -(u1 + u2)
+        d = _normalize(d)
+        if d is None:
+            return None
+        return Ci + d * bond_len
     
     for chain_idx, length in enumerate(lengths):
         chain_seq = original_sequence[seq_ptr : seq_ptr + length]
@@ -232,31 +251,14 @@ def write_complex_pdb(chains, original_sequence, out_path):
             lines.append(f"ATOM  {serial:5d}  C   {resn:>3s} {chain_id}{rid:4d}    {c_C[i][0]:8.3f}{c_C[i][1]:8.3f}{c_C[i][2]:8.3f}  1.00  0.00           C")
             serial += 1
             
-            # Sidechain + Oxygen
-            # Build Sidechain
+            Nnext = c_N[i + 1] if (i + 1) < length else c_N[i]
+            O_pos = _carbonyl_O(c_C[i], c_CA[i], Nnext, bond_len=1.229)
+            if O_pos is not None:
+                lines.append(f"ATOM  {serial:5d}  O   {resn:>3s} {chain_id}{rid:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O")
+                serial += 1
+
             if aa != "G":
                 sc_atoms = pack_sidechain(aa, c_N[i], c_CA[i], c_C[i], env_atoms)
-                
-                # Approximate O (Backbone Carbonyl)
-                try:
-                    # Simple geometric construction for O
-                    # O = C + 1.23 * (rotated vector)
-                    v = c_C[i] - c_CA[i]
-                    v /= np.linalg.norm(v)
-                    w = c_N[i] - c_CA[i]
-                    w /= np.linalg.norm(w)
-                    n = np.cross(v, w)
-                    n /= np.linalg.norm(n)
-                    
-                    # Rotate v around n by 120 degrees (2.1 rad)
-                    theta = 2.1
-                    v_rot = v * math.cos(theta) + np.cross(n, v) * math.sin(theta) + n * np.dot(n, v) * (1 - math.cos(theta))
-                    
-                    O_pos = c_C[i] + 1.23 * v_rot
-                    lines.append(f"ATOM  {serial:5d}  O   {resn:>3s} {chain_id}{rid:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O")
-                    serial += 1
-                except:
-                    pass
 
                 # Sort and write sidechain atoms
                 order = ["CB", "CG", "CG1", "CG2", "OG", "OG1", "SG", 
@@ -272,22 +274,6 @@ def write_complex_pdb(chains, original_sequence, out_path):
                     element = atom_name[0]
                     lines.append(f"ATOM  {serial:5d}  {atom_name:<4s}{resn:>3s} {chain_id}{rid:4d}    {pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}  1.00  0.00           {element}")
                     serial += 1
-            else:
-                # Glycine O
-                try:
-                    v = c_C[i] - c_CA[i]
-                    v /= np.linalg.norm(v)
-                    w = c_N[i] - c_CA[i]
-                    w /= np.linalg.norm(w)
-                    n = np.cross(v, w)
-                    n /= np.linalg.norm(n)
-                    theta = 2.1
-                    v_rot = v * math.cos(theta) + np.cross(n, v) * math.sin(theta) + n * np.dot(n, v) * (1 - math.cos(theta))
-                    O_pos = c_C[i] + 1.23 * v_rot
-                    lines.append(f"ATOM  {serial:5d}  O   {resn:>3s} {chain_id}{rid:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O")
-                    serial += 1
-                except:
-                    pass
 
             rid += 1
             
@@ -298,5 +284,6 @@ def write_complex_pdb(chains, original_sequence, out_path):
     
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+        f.write("\n")
         
     return True

@@ -13,7 +13,7 @@ three_letter = {
 
 # Refined Bond Parameters (Engh & Huber, 1991)
 BOND_PARAMS = {
-    "n_len": 1.33,
+    "n_len": 1.329,
     "ca_len": 1.46,
     "c_len": 1.52,
     "ang_C_N_CA": math.radians(121.7),
@@ -23,25 +23,88 @@ BOND_PARAMS = {
 BOND_PARAMS["cos_N_CA_C"] = math.cos(BOND_PARAMS["ang_N_CA_C"])
 BOND_PARAMS["sin_N_CA_C"] = math.sin(BOND_PARAMS["ang_N_CA_C"])
 
-def ss_to_phi_psi(ss):
+_BOND_CO_LEN = 1.229
+
+def ss_to_phi_psi(ss, sequence=None):
     phi = []
     psi = []
-    for c in ss:
+    seq = sequence if sequence is not None else ("A" * len(ss))
+    for i, c in enumerate(ss):
+        aa = seq[i] if i < len(seq) else "A"
         if c == "H":
-            # Ideal Alpha Helix
-            phi.append(-math.radians(57.0))
-            psi.append(-math.radians(47.0))
+            p = -57.0
+            s = -47.0
         elif c == "E":
-            # Ideal Beta Sheet (Parallel/Anti-parallel avg)
-            phi.append(-math.radians(119.0))
-            psi.append(math.radians(113.0))
+            p = -119.0
+            s = 113.0
         else:
-            # Coil / Loop (Ramachandran favored)
-            # Typically -60 to -90 phi, +120 to +160 psi for Polyproline II like
-            # Randomize slightly to avoid flat sticks
-            phi.append(math.radians(-60.0 + np.random.uniform(-10, 10)))
-            psi.append(math.radians(140.0 + np.random.uniform(-10, 10)))
+            if aa == "G":
+                p = -120.0 + np.random.uniform(-30.0, 30.0)
+                s = 130.0 + np.random.uniform(-30.0, 30.0)
+            else:
+                r = np.random.rand()
+                if r < 0.6 and aa != "P":
+                    p = -60.0 + np.random.uniform(-20.0, 20.0)
+                    s = -45.0 + np.random.uniform(-20.0, 20.0)
+                else:
+                    p = -120.0 + np.random.uniform(-30.0, 30.0)
+                    s = 130.0 + np.random.uniform(-30.0, 30.0)
+
+        if aa == "P":
+            p = -65.0 + np.random.uniform(-10.0, 10.0)
+
+        phi.append(math.radians(p))
+        psi.append(math.radians(s))
     return np.array(phi), np.array(psi)
+
+def _wrap_pi(x):
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+_RAMA_PREF = {
+    "General": np.array([[-60.0, -45.0], [-120.0, 120.0], [-75.0, 145.0]], dtype=float) * (np.pi / 180.0),
+    "GLY": np.array([[-60.0, -45.0], [-120.0, 120.0], [-75.0, 145.0], [60.0, 30.0]], dtype=float) * (np.pi / 180.0),
+    "PRO": np.array([[-65.0, 150.0], [-75.0, 145.0]], dtype=float) * (np.pi / 180.0),
+}
+_RAMA_SIGMA = {
+    "General": np.array([25.0, 25.0], dtype=float) * (np.pi / 180.0),
+    "GLY": np.array([35.0, 35.0], dtype=float) * (np.pi / 180.0),
+    "PRO": np.array([20.0, 20.0], dtype=float) * (np.pi / 180.0),
+}
+
+def _rama_loss(phi, psi, sequence):
+    if len(phi) == 0:
+        return 0.0
+    loss = 0.0
+    for i in range(len(phi)):
+        aa = sequence[i] if i < len(sequence) else "A"
+        grp = "General"
+        if aa == "G":
+            grp = "GLY"
+        elif aa == "P":
+            grp = "PRO"
+        centers = _RAMA_PREF[grp]
+        sigma = _RAMA_SIGMA[grp]
+        dp = _wrap_pi(phi[i] - centers[:, 0]) / sigma[0]
+        dq = _wrap_pi(psi[i] - centers[:, 1]) / sigma[1]
+        loss += float(np.min(dp * dp + dq * dq))
+    return loss
+
+def _normalize(v):
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return None
+    return v / n
+
+def carbonyl_oxygen_position(Ci, CAi, Nnext, bond_len=_BOND_CO_LEN):
+    u1 = _normalize(CAi - Ci)
+    u2 = _normalize(Nnext - Ci)
+    if u1 is None or u2 is None:
+        return None
+    d = -(u1 + u2)
+    d = _normalize(d)
+    if d is None:
+        return None
+    return Ci + d * bond_len
 
 def place_atom(a, b, c, bond_len, bond_angle, torsion):
     """
@@ -166,6 +229,7 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
         res_idx = 1
         chain_id = "A"
         chain_idx = 0
+        env_atoms = []
         
         # Determine chain intervals
         intervals = []
@@ -204,51 +268,32 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
             f.write(f"ATOM  {atom_idx:5d}  C   {resn:>3s} {chain_id}{res_idx:4d}    {C[i][0]:8.3f}{C[i][1]:8.3f}{C[i][2]:8.3f}  1.00  0.00           C\n")
             atom_idx += 1
             
-            # Sidechain
-            # Only if not GLY
+            next_N = None
+            if i + 1 < len(sequence) and (i + 1) < next_break:
+                next_N = N[i + 1]
+            else:
+                next_N = N[i]
+            O_pos = carbonyl_oxygen_position(C[i], CA[i], next_N, bond_len=_BOND_CO_LEN)
+            if O_pos is not None:
+                v1 = CA[i] - N[i]
+                v2 = C[i] - CA[i]
+                nrm = np.cross(v1, v2)
+                nl = np.linalg.norm(nrm)
+                if nl > 1e-6:
+                    nrm = nrm / nl
+                    dproj = np.dot(O_pos - N[i], nrm)
+                    O_pos = O_pos - dproj * nrm
+            if O_pos is not None:
+                f.write(f"ATOM  {atom_idx:5d}  O   {resn:>3s} {chain_id}{res_idx:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O\n")
+                atom_idx += 1
+                env_atoms.append(O_pos)
+            env_atoms.append(N[i])
+            env_atoms.append(CA[i])
+            env_atoms.append(C[i])
+
             if aa != "G":
-                # Build sidechain atoms
                 from modules.sidechain_builder import pack_sidechain
-                sc_atoms = pack_sidechain(aa, N[i], CA[i], C[i])
-                
-                # Order matters for PDB but visualizing tools are flexible.
-                # Standard order: N, CA, C, O, CB...
-                
-                # We missed Oxygen (O) in backbone!
-                # O is bonded to C.
-                # Standard geometry: C=O bond length 1.23, bisects N-C-CA?
-                # Actually, in planar peptide bond, O is in plane defined by CA(i), C(i), N(i+1).
-                # But we don't have N(i+1) easily here if it's the last residue or chain break.
-                # We can approximate O position: 
-                # Vector C-O is opposite to C-CA roughly? No.
-                # Angle CA-C-O ~ 120.8, N(+1)-C-O ~ 123.
-                # It lies in the plane CA-C-N(+1).
-                # Since psi determines C rotation, and we built C based on psi,
-                # we can place O relative to CA-C frame.
-                
-                # Let's add O first (backbone carbonyl)
-                # Need N, CA, C coordinates.
-                # Use NeRF-like placement or geometric relative to C.
-                # Vector u_c_ca = (CA - C).norm
-                # Vector u_c_n_next?
-                # Without next residue, assume trans planar.
-                # Place O in the plane of CA-C-N(previous) but rotated?
-                # Actually, O is usually placed such that C=O and N-H are anti-parallel in sheets/helices.
-                
-                # Simple approximation:
-                # O is in the plane of N-CA-C? No.
-                # O is in the peptide plane.
-                # We can construct O using CA, C and a virtual atom?
-                
-                # Let's compute O coordinate:
-                # O = place_atom(CA[i], C[i], N[i], 1.23, 120 deg, 180 deg) ? 
-                # This would place it trans to N relative to C-CA bond.
-                try:
-                    O_pos = place_atom(CA[i], C[i], N[i], 1.23, math.radians(120.8), math.pi)
-                    f.write(f"ATOM  {atom_idx:5d}  O   {resn:>3s} {chain_id}{res_idx:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O\n")
-                    atom_idx += 1
-                except:
-                    pass
+                sc_atoms = pack_sidechain(aa, N[i], CA[i], C[i], local_environment_atoms=np.array(env_atoms) if len(env_atoms) > 0 else None)
 
                 # Write Sidechain atoms
                 # Sort keys to maintain some standard order (CB, CG, CD...)
@@ -269,14 +314,7 @@ def write_pdb(sequence, N, CA, C, out_path, chain_breaks=None):
                     element = atom_name[0]
                     f.write(f"ATOM  {atom_idx:5d}  {atom_name:<4s}{resn:>3s} {chain_id}{res_idx:4d}    {pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}  1.00  0.00           {element}\n")
                     atom_idx += 1
-            else:
-                # GLY still has O
-                try:
-                    O_pos = place_atom(CA[i], C[i], N[i], 1.23, math.radians(120.8), math.pi)
-                    f.write(f"ATOM  {atom_idx:5d}  O   {resn:>3s} {chain_id}{res_idx:4d}    {O_pos[0]:8.3f}{O_pos[1]:8.3f}{O_pos[2]:8.3f}  1.00  0.00           O\n")
-                    atom_idx += 1
-                except:
-                    pass
+                    env_atoms.append(pos)
 
             res_idx += 1
             
@@ -306,6 +344,7 @@ def _objective_joint(x, chain_data, total_residues):
     idx = 0
     rb_idx = 0
     t_ang = 0.0
+    t_rama = 0.0
     
     for i, (seq, ss, phi_ref, psi_ref) in enumerate(chain_data):
         n = len(seq)
@@ -316,11 +355,16 @@ def _objective_joint(x, chain_data, total_residues):
         # Weighted angle constraint
         # SS 'C' -> weight 0.1, others 1.0
         # Can be precomputed, but here SS is string.
-        weights = np.array([0.1 if c == 'C' else 1.0 for c in ss])
+        weights = np.array([0.5 if c == 'C' else 1.0 for c in ss])
         
         d_phi = (phi - phi_ref + np.pi) % (2 * np.pi) - np.pi
         d_psi = (psi - psi_ref + np.pi) % (2 * np.pi) - np.pi
         t_ang += np.sum(weights * (d_phi**2 + d_psi**2))
+
+        try:
+            t_rama += _rama_loss(phi, psi, seq)
+        except Exception:
+            pass
         
         try:
             N_c, CA_c, C_c = build_backbone(seq, phi, psi)
@@ -347,14 +391,13 @@ def _objective_joint(x, chain_data, total_residues):
     mask = np.triu(np.ones(dd.shape, dtype=bool), k=2)
     dists = dd[mask]
     
-    clash_mask = dists < 3.5
+    clash_mask = dists < 3.6
     if np.any(clash_mask):
         t_clash = np.sum((3.5 - dists[clash_mask]) ** 2)
     else:
         t_clash = 0.0
         
-    # Increased Rg weight (0.1 -> 0.5) to fix "stick" structures for Coil-heavy proteins
-    return 0.5 * rg2 + 10.0 * t_clash + 5.0 * t_ang
+    return 0.5 * rg2 + 10.0 * t_clash + 5.0 * t_ang + 3.0 * t_rama
 
 def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
     if not chain_ss_list: return False
@@ -370,7 +413,7 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
         L = len(ss)
         sub_seq = sequence[start_idx : start_idx + L]
         start_idx += L
-        phi0, psi0 = ss_to_phi_psi(ss)
+        phi0, psi0 = ss_to_phi_psi(ss, sub_seq)
         chain_data.append((sub_seq, ss, phi0, psi0))
         total_residues += L
         
@@ -469,4 +512,3 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
 def run_backbone_fold_multichain(sequence, chain_ss_list, output_pdb, chain_slices=None):
     # Backward compatibility wrapper: now calls optimization
     return optimize_from_ss(sequence, chain_ss_list, output_pdb)
-
