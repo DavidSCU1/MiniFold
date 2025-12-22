@@ -99,11 +99,10 @@ HB_MAX_DIST = 3.5
 HB_MIN_ANGLE = math.radians(120)
 
 # 2. Ramachandran Preferred Regions (Simplified Gaussian Mixtures)
-# We define "centers" for General, Glycine, Proline
 RAMA_PREF = {
     "General": [
-        (-1.2, 2.4), # Beta
-        (-1.0, -0.8) # Alpha
+        (-1.2, 2.4),
+        (-1.0, -0.8)
     ],
     "GLY": [
         (1.4, -2.8),
@@ -112,8 +111,8 @@ RAMA_PREF = {
         (-1.4, -2.8)
     ],
     "PRO": [
-        (-1.0, 2.6), # PolyPro II
-        (-1.0, -0.5) # Alpha
+        (-1.0, 2.6),
+        (-1.0, -0.5)
     ]
 }
 RAMA_SIGMA = {
@@ -283,7 +282,10 @@ def ss_to_phi_psi_tensor(ss, sequence=None):
             if grp == "PRO" and len(centers) >= 2:
                 k = 0 if (np.random.rand() < 0.7) else 1
             elif grp == "General" and len(centers) >= 2:
-                k = 1 if (np.random.rand() < 0.6) else 0
+                if aa in ("V", "I", "L"):
+                    k = 1 if (np.random.rand() < 0.75) else 0
+                else:
+                    k = 1 if (np.random.rand() < 0.6) else 0
             else:
                 k = int(np.random.randint(0, len(centers)))
             cp, cq = centers[k]
@@ -634,6 +636,10 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         collapse_hydro_mask = torch.tensor(col_hydro_list, device=device)
         charged_clash_mask = torch.tensor(chg_clash_list, device=device)
         
+        beta_mask = torch.tensor([1.0 if c == "E" else 0.0 for c in ss], device=device)
+        helix_mask = torch.tensor([1.0 if c == "H" else 0.0 for c in ss], device=device)
+        loop_mask = torch.tensor([1.0 if c == "C" else 0.0 for c in ss], device=device)
+        
         rama_group_ids = torch.tensor(
             [1 if a == "G" else (2 if a == "P" else 0) for a in sub_seq],
             device=device,
@@ -653,6 +659,9 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             "aromatic_mask": aromatic_mask,
             "collapse_hydro_mask": collapse_hydro_mask,
             "charged_clash_mask": charged_clash_mask,
+            "beta_mask": beta_mask,
+            "helix_mask": helix_mask,
+            "loop_mask": loop_mask,
             "rama_group_ids": rama_group_ids,
             "prepro_mask": torch.tensor([1.0 if (j + 1 < len(sub_seq) and sub_seq[j + 1] == "P") else 0.0 for j in range(len(sub_seq))], device=device, dtype=torch.float32),
         })
@@ -744,7 +753,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         device=device,
         dtype=torch.long,
     )
-
+    
     full_hydro = torch.cat([d["hydro_mask"] for d in chain_data], dim=0)
     full_charge = torch.cat([d["charge"] for d in chain_data], dim=0)
     full_polar = torch.cat([d["polar_mask"] for d in chain_data], dim=0)
@@ -752,20 +761,147 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
     
     full_collapse_hydro = torch.cat([d["collapse_hydro_mask"] for d in chain_data], dim=0)
     full_charged_clash = torch.cat([d["charged_clash_mask"] for d in chain_data], dim=0)
-
+    
+    full_beta = torch.cat([d.get("beta_mask", torch.zeros(len(d["seq"]), device=device)) for d in chain_data], dim=0)
+    full_helix = torch.cat([d.get("helix_mask", torch.zeros(len(d["seq"]), device=device)) for d in chain_data], dim=0)
+    full_loop = torch.cat([d.get("loop_mask", torch.zeros(len(d["seq"]), device=device)) for d in chain_data], dim=0)
+    
     idx = torch.arange(total_residues, device=device)
     idx_diff = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
     mask_nonlocal = (torch.triu(torch.ones((total_residues, total_residues), device=device), diagonal=3) > 0).float()
     cross_mask = (chain_ids.unsqueeze(0) != chain_ids.unsqueeze(1)).float()
-
+    
     n_full_atoms = total_residues * 4
     n_heavy_atoms = total_residues * 5
     clash_mask = torch.triu(torch.ones((n_full_atoms, n_full_atoms), device=device), diagonal=2) > 0
     heavy_pair_mask = torch.triu(torch.ones((n_heavy_atoms, n_heavy_atoms), device=device), diagonal=2) > 0
-
+    
     cys_indices = torch.nonzero(aa_indices == MJ_INDEX["C"]).flatten()
     
+<<<<<<< HEAD
     opt_phase = "coarse"
+=======
+    w_rg = torch.tensor(1.5, device=device)
+    w_rg_tgt = torch.tensor(1.2, device=device)
+    w_clash = torch.tensor(5.0, device=device)
+    w_hard_clash = torch.tensor(10.0, device=device)
+    w_heavy = torch.tensor(4.5, device=device)
+    w_ca_cont = torch.tensor(5.0, device=device)
+    w_ss = torch.tensor(2.0, device=device)
+    w_rama = torch.tensor(4.0, device=device)
+    w_omega = torch.tensor(3.0, device=device)
+    w_hb = torch.tensor(4.0, device=device)
+    w_beta_sheet = torch.tensor(3.0, device=device)
+    w_hydro = torch.tensor(3.0, device=device)
+    w_iface_hydro = torch.tensor(2.5, device=device)
+    w_elec = torch.tensor(1.5, device=device)
+    w_catpi = torch.tensor(1.0, device=device)
+    w_pipi = torch.tensor(1.0, device=device)
+    w_lj = torch.tensor(0.5, device=device)
+    w_burial = torch.tensor(5.0, device=device)
+    w_polar = torch.tensor(2.0, device=device)
+    w_rotamer_dir = torch.tensor(1.5, device=device)
+    w_loop = torch.tensor(1.0, device=device)
+    w_smooth = torch.tensor(0.0, device=device)
+    w_mj = torch.tensor(4.0, device=device)
+    w_disulfide = torch.tensor(5.0, device=device)
+    w_ca_hard36 = torch.tensor(10.0, device=device)
+    w_hydro_collapse = torch.tensor(2.0, device=device)
+    w_charged_clash = torch.tensor(50.0, device=device)
+    w_longrange = torch.tensor(0.05, device=device)
+    
+    def set_phase_weights(phase):
+        if phase == 1:
+            w_rg_tgt.fill_(1.2)
+            w_rg.fill_(1.5)
+            w_ss.fill_(2.0)
+            w_rama.fill_(4.0)
+            w_omega.fill_(3.0)
+            w_smooth.fill_(0.5)
+            w_heavy.fill_(4.5)
+            w_clash.fill_(5.0)
+            w_hard_clash.fill_(10.0)
+            w_ca_cont.fill_(5.0)
+            w_hb.fill_(2.0)
+            w_beta_sheet.fill_(0.0)
+            w_hydro.fill_(0.0)
+            w_iface_hydro.fill_(0.0)
+            w_elec.fill_(0.0)
+            w_catpi.fill_(0.0)
+            w_pipi.fill_(0.0)
+            w_lj.fill_(0.0)
+            w_burial.fill_(0.0)
+            w_polar.fill_(0.0)
+            w_rotamer_dir.fill_(0.0)
+            w_loop.fill_(0.0)
+            w_mj.fill_(0.0)
+            w_disulfide.fill_(0.0)
+            w_ca_hard36.fill_(10.0)
+            w_hydro_collapse.fill_(2.0)
+            w_charged_clash.fill_(50.0)
+            w_longrange.fill_(0.0)
+        elif phase == 2:
+            w_rg_tgt.fill_(1.2)
+            w_rg.fill_(1.5)
+            w_ss.fill_(1.5)
+            w_rama.fill_(4.0)
+            w_omega.fill_(3.0)
+            w_smooth.fill_(0.2)
+            w_heavy.fill_(4.5)
+            w_clash.fill_(5.0)
+            w_hard_clash.fill_(10.0)
+            w_ca_cont.fill_(5.0)
+            w_hb.fill_(3.0)
+            w_beta_sheet.fill_(1.5)
+            w_hydro.fill_(2.5)
+            w_iface_hydro.fill_(1.5)
+            w_elec.fill_(1.0)
+            w_catpi.fill_(0.5)
+            w_pipi.fill_(0.5)
+            w_lj.fill_(0.3)
+            w_burial.fill_(5.0)
+            w_polar.fill_(2.0)
+            w_rotamer_dir.fill_(1.5)
+            w_loop.fill_(0.5)
+            w_mj.fill_(2.0)
+            w_disulfide.fill_(3.0)
+            w_ca_hard36.fill_(10.0)
+            w_hydro_collapse.fill_(2.0)
+            w_charged_clash.fill_(50.0)
+            w_longrange.fill_(0.05)
+        else:
+            w_rg_tgt.fill_(1.2)
+            w_rg.fill_(1.5)
+            w_ss.fill_(2.0)
+            w_rama.fill_(4.0)
+            w_omega.fill_(3.0)
+            w_smooth.fill_(0.0)
+            w_heavy.fill_(4.5)
+            w_clash.fill_(5.0)
+            w_hard_clash.fill_(10.0)
+            w_ca_cont.fill_(5.0)
+            w_hb.fill_(4.0)
+            w_beta_sheet.fill_(3.0)
+            w_hydro.fill_(3.0)
+            w_iface_hydro.fill_(2.5)
+            w_elec.fill_(1.5)
+            w_catpi.fill_(1.0)
+            w_pipi.fill_(1.0)
+            w_lj.fill_(0.5)
+            w_burial.fill_(5.0)
+            w_polar.fill_(2.0)
+            w_rotamer_dir.fill_(1.5)
+            w_loop.fill_(1.0)
+            w_mj.fill_(4.0)
+            w_disulfide.fill_(5.0)
+            w_ca_hard36.fill_(10.0)
+            w_hydro_collapse.fill_(2.0)
+            w_charged_clash.fill_(50.0)
+            w_longrange.fill_(0.05)
+    
+    set_phase_weights(1)
+    
+>>>>>>> f9c7442 (Update folding engine constraints and docs)
     def calc_loss():
         all_N, all_CA, all_C, all_O, all_H, all_CB = [], [], [], [], [], []
         loss_ss = torch.tensor(0.0, device=device)
@@ -808,40 +944,51 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             if group_ids is None:
                 group_ids = torch.zeros((len(d["seq"]),), device=device, dtype=torch.long)
 
-            c_t = rama_centers_pad.index_select(0, group_ids)  # (L, K, 2)
-            v_t = rama_valid_pad.index_select(0, group_ids)    # (L, K)
-            s_t = rama_sigma.index_select(0, group_ids)        # (L, 2)
-
-            phi_ex = phi.unsqueeze(1)  # (L, 1)
-            psi_ex = psi.unsqueeze(1)  # (L, 1)
-
+            c_t = rama_centers_pad.index_select(0, group_ids)
+            v_t = rama_valid_pad.index_select(0, group_ids)
+            s_t = rama_sigma.index_select(0, group_ids)
+            
+            phi_ex = phi.unsqueeze(1)
+            psi_ex = psi.unsqueeze(1)
+            
             dphi = torch.remainder(phi_ex - c_t[:, :, 0] + math.pi, 2 * math.pi) - math.pi
             dpsi = torch.remainder(psi_ex - c_t[:, :, 1] + math.pi, 2 * math.pi) - math.pi
-
+            
             term = (dphi / (s_t[:, 0:1] + 1e-9)) ** 2 + (dpsi / (s_t[:, 1:2] + 1e-9)) ** 2
             term = term + (1.0 - v_t) * 1e6
-
-            min_term = torch.min(term, dim=1)[0]
             
-            # User Feedback: Relax Rama "Perfectionism"
-            # Allow 3% outliers (ignore the worst 3% of residues from the loss)
-            n_res = min_term.size(0)
+            valid_counts = torch.sum(v_t, dim=1).clamp(min=1.0)
+            log_prob = torch.logsumexp(-0.5 * term, dim=1) - torch.log(valid_counts + 1e-9)
+            rama_e = -log_prob
+            
+            seq = d.get("seq", "")
+            if isinstance(seq, str) and len(seq) == rama_e.size(0):
+                weights = torch.ones_like(rama_e)
+                for idx_res, aa in enumerate(seq):
+                    if aa in ("V", "I", "L"):
+                        weights[idx_res] = weights[idx_res] * 1.3
+                    elif aa == "G":
+                        weights[idx_res] = weights[idx_res] * 0.8
+                    elif aa == "P":
+                        weights[idx_res] = weights[idx_res] * 1.5
+                rama_e = rama_e * weights
+            
+            n_res = rama_e.size(0)
             n_keep = max(1, int(n_res * 0.97))
-            
-            sorted_term, _ = torch.sort(min_term)
-            valid_term = sorted_term[:n_keep]
-            
-            # Soft Potential: Flat bottom (no force if within 1.0 sigma^2)
-            # Remove the hard penalty for outliers (relu(min_term - 4.0)**2 * 25.0)
-            rama_soft = torch.sum(torch.relu(valid_term - 1.0))
-            loss_rama = loss_rama + rama_soft
+            sorted_e, _ = torch.sort(rama_e)
+            valid_e = sorted_e[:n_keep]
+            loss_rama = loss_rama + torch.sum(valid_e)
 
             pro_mask = (group_ids == 2).float()
             if pro_mask.numel() > 0:
                 pro_phi0 = torch.tensor(math.radians(-65.0), device=device)
                 pro_dphi = torch.remainder(phi - pro_phi0 + math.pi, 2 * math.pi) - math.pi
-                # Relaxed Proline constraint: Weight 10.0 -> 0.5 to allow kinks
-                loss_rama = loss_rama + torch.sum((pro_dphi / math.radians(10.0)) ** 2 * pro_mask) * 0.5
+                loss_rama = loss_rama + torch.sum((pro_dphi / math.radians(10.0)) ** 2 * pro_mask)
+                helix_mask_local = d.get("helix_mask")
+                if helix_mask_local is not None:
+                    pro_helix = pro_mask * helix_mask_local
+                    if pro_helix.numel() > 0:
+                        loss_rama = loss_rama + torch.sum(pro_helix) * 10.0
 
             omega_valid = torch.ones_like(omega)
             if omega_valid.numel() > 0:
@@ -855,6 +1002,10 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 prepro_mask = torch.zeros_like(omega)
             omega_term = torch.where(prepro_mask > 0.5, torch.minimum(trans_term, cis_term), trans_term)
             loss_omega = loss_omega + torch.sum(omega_term * omega_valid) + torch.sum(torch.relu(omega_term - 1.0) ** 2 * omega_valid) * 50.0
+            if prepro_mask.numel() > 0 and psi.numel() == prepro_mask.numel():
+                psi_target_pre = math.radians(145.0)
+                d_psi_pre = torch.remainder(psi - psi_target_pre + math.pi, 2 * math.pi) - math.pi
+                loss_rama = loss_rama + torch.sum((d_psi_pre / math.radians(25.0)) ** 2 * prepro_mask) * 0.5
             
             diff_phi = phi[1:] - phi[:-1]
             diff_psi = psi[1:] - psi[:-1]
@@ -937,6 +1088,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         ca_pen = torch.relu(3.6 - dist_ca_pairs) ** 2
         loss_ca_hard36 = torch.sum(ca_pen[pair_mask_ca])
         
+<<<<<<< HEAD
         eps_values = torch.tensor([0.12, 0.10, 0.15, 0.20, 0.18], device=device, dtype=heavy_atoms.dtype)
         eps_flat = eps_values.repeat(total_residues)
         sigma_ij = vdW_sum / (2.0 ** (1.0 / 6.0))
@@ -955,8 +1107,10 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         # Hydrophobic Effect
         # Optimize CB distance
         # full_CB: (N_res, 3)
+=======
+>>>>>>> f9c7442 (Update folding engine constraints and docs)
         dist_cb = torch.cdist(full_CB, full_CB, p=2.0) + 1e-6
-        diff_cb = full_CB.unsqueeze(0) - full_CB.unsqueeze(1) # Keep for vectors
+        diff_cb = full_CB.unsqueeze(0) - full_CB.unsqueeze(1)
         
         u_vec = full_CB - full_CA
         u_vec = u_vec / (torch.norm(u_vec, dim=1, keepdim=True) + 1e-6)
@@ -1024,8 +1178,31 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         near_mask = ((idx_diff > 2) & (dist_ca < 8.0)).float()
         neighbor_counts = torch.sum(near_mask, dim=1)
         exposure = 1.0 / (1.0 + neighbor_counts)
-        loss_burial = torch.sum(full_hydro * exposure)
+        
+        buried = 1.0 - exposure
+        burial_score = full_hydro * buried
+        burial_reward = torch.sum(burial_score * burial_score)
+        exposure_bad = full_hydro * torch.relu(exposure - 0.35)
+        exposure_penalty = torch.sum(exposure_bad * exposure_bad) * 4.0
+        loss_burial = exposure_penalty - burial_reward
         loss_polar = torch.sum(full_polar * (1.0 - exposure))
+        
+        core_center = torch.sum(full_CA * full_hydro.unsqueeze(1), dim=0) / (torch.sum(full_hydro) + 1e-6)
+        core_vec = core_center.unsqueeze(0) - full_CA
+        core_unit = core_vec / (torch.norm(core_vec, dim=1, keepdim=True) + 1e-6)
+        dot_core = torch.sum(u_vec * core_unit, dim=1)
+        dot_scaled = (dot_core + 1.0) * 0.5
+        loss_rotamer_dir = torch.sum(full_hydro * ((1.0 - dot_scaled) ** 2))
+        
+        same_chain_mat = (chain_ids.unsqueeze(0) == chain_ids.unsqueeze(1)).float()
+        loop_mat = full_loop.unsqueeze(0) * full_loop.unsqueeze(1) * same_chain_mat
+        local_loop_mask = loop_mat * (((idx_diff == 2) | (idx_diff == 3)).float())
+        loop_target = 6.0
+        loss_loop_local = torch.sum(((dist_ca - loop_target) ** 2) * local_loop_mask)
+        nonlocal_loop_mask = loop_mat * (idx_diff >= 4).float()
+        loop_contact = torch.exp(-((dist_ca - 7.0) ** 2) / (2.0 * (2.0 ** 2)))
+        loss_loop_contact = -torch.sum(loop_contact * nonlocal_loop_mask)
+        loss_loop_compact = loss_loop_local + loss_loop_contact
         
         full_H = torch.cat(all_H)
         diff_ho = full_H.unsqueeze(1) - full_O.unsqueeze(0)
@@ -1036,10 +1213,41 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         ho_unit = diff_ho / (dist_ho.unsqueeze(2))
         cos_ang = torch.sum(hn_unit.unsqueeze(1) * ho_unit, dim=2).clamp(-1.0, 1.0)
         ang = torch.acos(cos_ang)
-        dist_w = torch.exp(-((dist_ho - HB_OPT_DIST)**2) / (0.25**2))
-        ang_w = torch.exp(-((ang - HB_OPT_ANGLE)**2) / (math.radians(20)**2))
+        dist_w = torch.exp(-((dist_ho - HB_OPT_DIST) ** 2) / (0.25 ** 2))
+        ang_w = torch.exp(-((ang - HB_OPT_ANGLE) ** 2) / (math.radians(20) ** 2))
         hb_score = dist_w * ang_w * hb_mask
         hb_energy = -torch.sum(hb_score) * 0.5
+        
+        tangent = torch.zeros_like(full_CA)
+        for cid in range(num_chains):
+            chain_mask = (chain_ids == cid)
+            chain_idx = torch.nonzero(chain_mask).flatten()
+            if chain_idx.numel() < 2:
+                continue
+            ca_chain = full_CA[chain_idx]
+            f_diff = torch.zeros_like(ca_chain)
+            b_diff = torch.zeros_like(ca_chain)
+            f_diff[:-1] = ca_chain[1:] - ca_chain[:-1]
+            b_diff[1:] = ca_chain[1:] - ca_chain[:-1]
+            t = f_diff + b_diff
+            t = t / (torch.norm(t, dim=1, keepdim=True) + 1e-6)
+            tangent[chain_idx] = t
+        
+        t_i = tangent.unsqueeze(1)
+        t_j = tangent.unsqueeze(0)
+        cos_strand = torch.sum(t_i * t_j, dim=2).clamp(-1.0, 1.0)
+        strand_align = torch.abs(cos_strand)
+        
+        beta_pair = full_beta.unsqueeze(0) * full_beta.unsqueeze(1) * same_chain_mat
+        hb_beta = hb_score * beta_pair
+        beta_align_score = hb_beta * strand_align
+        
+        ladder_parallel = hb_beta[1:, 1:] * hb_beta[:-1, :-1]
+        ladder_antiparallel = hb_beta[1:, :-1] * hb_beta[:-1, 1:]
+        ladder_score = torch.sum(ladder_parallel + ladder_antiparallel)
+        hb_beta_sum = torch.sum(hb_beta)
+        registry_penalty = torch.relu(hb_beta_sum - ladder_score)
+        loss_beta_sheet = -torch.sum(beta_align_score) + registry_penalty
         
         # Disulfide Bonds (Cys-Cys)
         # Biological Rule: Cysteines in oxidizing environments tend to form disulfide bridges.
@@ -1082,6 +1290,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         
         loss_charged_clash = torch.sum(d4_mask * chg_clash_mat * pair_mask_ca.float())
 
+<<<<<<< HEAD
         # Weights (Tuned for Bio-plausibility)
         w_rg = 1.5
         w_rg_tgt = 1.2
@@ -1130,6 +1339,46 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 loss_lj * w_lj + loss_vdw * w_vdw_heavy + loss_burial * w_burial + loss_polar * w_polar +
                 hb_energy * w_hb + loss_disulfide * w_disulfide + loss_ca_hard36 * w_ca_hard36 + loss_frag * w_frag +
                 loss_hydro_collapse * w_hydro_collapse + loss_charged_clash * w_charged_clash)
+=======
+        long_mask = (idx_diff > 10).float() * pair_mask_ca.float()
+        hydro_pair = full_collapse_hydro.unsqueeze(0) * full_collapse_hydro.unsqueeze(1)
+        charge_mat = full_charge.unsqueeze(0) * full_charge.unsqueeze(1)
+        comp_mask = (charge_mat < 0.0).float()
+        attr_mask = torch.clamp(hydro_pair + comp_mask, max=1.0) * long_mask
+        inv_d6 = 1.0 / (torch.pow(dist_ca_pairs, 6) + 1e-6)
+        loss_longrange = -torch.sum(attr_mask * inv_d6)
+
+        loss = (
+            w_rg * rg2 +
+            w_rg_tgt * loss_rg_target +
+            w_clash * clash_loss +
+            w_hard_clash * loss_hard_clash +
+            w_heavy * heavy_loss +
+            w_ca_cont * loss_ca_continuity +
+            w_ss * loss_ss +
+            w_rama * loss_rama +
+            w_omega * loss_omega +
+            w_hb * hb_energy +
+            w_beta_sheet * loss_beta_sheet +
+            w_hydro * loss_hydro +
+            w_iface_hydro * loss_iface_hydro +
+            w_elec * loss_elec +
+            w_catpi * loss_catpi +
+            w_pipi * loss_pipi +
+            w_lj * loss_lj +
+            w_burial * loss_burial +
+            w_polar * loss_polar +
+            w_rotamer_dir * loss_rotamer_dir +
+            w_loop * loss_loop_compact +
+            w_smooth * loss_smooth +
+            w_mj * loss_mj +
+            w_ca_hard36 * loss_ca_hard36 +
+            w_disulfide * loss_disulfide +
+            w_hydro_collapse * loss_hydro_collapse +
+            w_charged_clash * loss_charged_clash +
+            w_longrange * loss_longrange
+        )
+>>>>>>> f9c7442 (Update folding engine constraints and docs)
         
         # Universal Constraints
         loss_constraints = torch.tensor(0.0, device=device)
@@ -1190,42 +1439,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         # Use safe addition to handle potential shape mismatches (scalar vs [1])
         loss = loss + loss_constraints
         return loss
-
-        if num_chains == 1:
-            w_iface_hydro = 0.0
-            w_mj = 2.0 # Single chain relies more on internal packing
-            w_elec = 1.2
-            w_rg_tgt = 1.5
-        else:
-            w_iface_hydro = 3.5
-            w_mj = 5.0 # Multi-chain: MJ is critical for docking specificity
-            w_elec = 2.0
-            w_rg_tgt = 1.0
-            w_catpi = 1.5
-            w_pipi = 1.5
-            w_lj = 1.2
-        
-        total_loss = (w_rg * rg2 + 
-                      w_rg_tgt * loss_rg_target +
-                      w_clash * clash_loss +
-                      w_heavy * heavy_loss +
-                      w_ss * loss_ss + 
-                      w_rama * loss_rama + 
-                      w_hb * hb_energy + 
-                      w_hydro * loss_hydro + 
-                      w_iface_hydro * loss_iface_hydro +
-                      w_elec * loss_elec +
-                      w_catpi * loss_catpi +
-                      w_pipi * loss_pipi +
-                      w_lj * loss_lj +
-                      w_burial * loss_burial +
-                      w_polar * loss_polar +
-                      w_smooth * loss_smooth +
-                      w_mj * loss_mj + 
-                      w_ca_hard36 * loss_ca_hard36 +
-                      w_disulfide * loss_disulfide)
-                      
-        return total_loss
     
     if os.environ.get("MINIFOLD_IGPU_COMPILE", "0") == "1" and hasattr(torch, "compile"):
         try:
@@ -1465,7 +1678,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         try:
             adam_steps = int(os.environ.get("MINIFOLD_IGPU_ADAM_STEPS", "50"))
         except Exception:
-            adam_steps = 150
+            adam_steps = 256
         adam_steps = max(1, adam_steps)
         try:
             log_every = int(os.environ.get("MINIFOLD_IGPU_LOG_EVERY", "5"))
@@ -1473,6 +1686,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             log_every = 5
 
         # Phase 1: Fast Coarse Folding (AdamW)
+        set_phase_weights(1)
         for step in range(adam_steps): 
             opt_adam.zero_grad(set_to_none=True)
             
@@ -1499,11 +1713,12 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 
         # Phase 2: Fine Refinement (LBFGS)
         # Only run LBFGS if loss is reasonably low or as final polish
+        set_phase_weights(2)
         logger.info(f"  > Start {s+1}/{num_starts}: LBFGS (Fine Tuning)")
         try:
             lbfgs_max_iter = int(os.environ.get("MINIFOLD_IGPU_LBFGS_MAX_ITER", "40"))
         except Exception:
-            lbfgs_max_iter = 480
+            lbfgs_max_iter = 960
         lbfgs_max_iter = max(1, lbfgs_max_iter)
 
         opt_lbfgs = torch.optim.LBFGS(all_params, max_iter=lbfgs_max_iter, tolerance_grad=1e-5, tolerance_change=1e-5, history_size=10, line_search_fn="strong_wolfe")
