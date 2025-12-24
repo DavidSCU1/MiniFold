@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import json
+import subprocess
 
 from modules.input_handler import load_fasta
 from modules.ss_generator import pybiomed_ss_candidates
@@ -13,6 +14,7 @@ from modules.assembler import parse_pdb_chains, assemble_chains, write_complex_p
 from modules.refine import run_refinements, analyze_ubiquitin_core
 from modules.quality import summarize_structure
 from modules.ark_module import ark_audit_structure, get_default_models
+from modules.esm_runner import predict_structure_with_esm
 
 def print_progress(percent, step):
     print(f"[PROGRESS] {percent}% - {step}")
@@ -36,6 +38,8 @@ def main():
     parser.add_argument("--repack-long-sides", action="store_true", help="Repack long sidechains (Lys/Gln/Glu)")
     parser.add_argument("--md", default=None, choices=[None, "openmm", "amber", "gromacs"], help="Short MD/minimization engine")
     parser.add_argument("--md-steps", type=int, default=0, help="MD steps for refinement (OpenMM recommended)")
+    parser.add_argument("--esm-backbone", action="store_true", help="Use ESM-based backbone model from 3d_moudel/best_model_gpu.pt")
+    parser.add_argument("--esm-env", default=None, help="Conda environment or python path for ESM backbone")
     
     args = parser.parse_args()
     
@@ -130,9 +134,9 @@ def main():
                 
                 print_progress(45, f"Refining best candidate (Attempt {refine_cnt}, Current Best={best_score:.4f})...")
                 
-                refiner_model = "doubao-seed-1-6-251015" 
+                refiner_model = "doubao-seed-1-8-251215"
                 if refiner_model not in models:
-                    refiner_model = models[0] # Fallback
+                    refiner_model = models[0]
                     
                 print(f"  > Using {refiner_model} to refine structure based on environment: '{args.env}'")
                 
@@ -338,7 +342,99 @@ def main():
                 pdb_path = os.path.join(three_d_dir, pdb_name)
                 
                 success = False
-                if args.igpu:
+                if getattr(args, "esm_backbone", False):
+                    print(f"  > Case {case_idx} (p={prob:.2f}): Generating backbone via ESM model (backend={args.backend})...")
+                    ss_str_for_case = "".join(chains)
+                    ss_path = os.path.join(workdir, f"{prefix}_case{case_idx}_ss.txt")
+                    with open(ss_path, "w", encoding="utf-8") as f:
+                        f.write(ss_str_for_case)
+                    npz_path = os.path.join(workdir, f"{prefix}_case{case_idx}_esm.npz")
+                    if getattr(args, "esm_env", None):
+                        runner_script = os.path.join(os.getcwd(), "modules", "esm_runner.py")
+                        if os.sep in args.esm_env or "/" in args.esm_env:
+                            cmd_list = [
+                                args.esm_env,
+                                runner_script,
+                                "--fasta",
+                                args.input,
+                                "--ss",
+                                ss_path,
+                                "--output",
+                                pdb_path,
+                                "--npz",
+                                npz_path,
+                            ]
+                            if args.backend and args.backend != "auto":
+                                cmd_list.extend(["--backend", args.backend])
+                            cmd_str = subprocess.list2cmdline(cmd_list)
+                        else:
+                            if sys.platform == "win32":
+                                backend_arg = f' --backend {args.backend}' if args.backend and args.backend != "auto" else ""
+                                cmd_str = (
+                                    f'cmd /c conda run -n {args.esm_env} python "{runner_script}" --fasta "{args.input}"'
+                                    f' --ss "{ss_path}" --output "{pdb_path}" --npz "{npz_path}"{backend_arg}'
+                                )
+                                cmd_list = cmd_str
+                            else:
+                                cmd_list = [
+                                    "conda",
+                                    "run",
+                                    "-n",
+                                    args.esm_env,
+                                    "python",
+                                    runner_script,
+                                    "--fasta",
+                                    args.input,
+                                    "--ss",
+                                    ss_path,
+                                    "--output",
+                                    pdb_path,
+                                    "--npz",
+                                    npz_path,
+                                ]
+                                if args.backend and args.backend != "auto":
+                                    cmd_list.extend(["--backend", args.backend])
+                                cmd_str = " ".join(cmd_list)
+                        try:
+                            use_shell = sys.platform == "win32"
+                            env_vars = os.environ.copy()
+                            env_vars["PYTHONIOENCODING"] = "utf-8"
+                            env_vars["PYTHONUTF8"] = "1"
+                            result = subprocess.run(
+                                cmd_str if sys.platform == "win32" else cmd_list,
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                shell=use_shell,
+                                env=env_vars,
+                            )
+                            if result.stdout:
+                                print(f"[ESM Output] {result.stdout.strip()}")
+                            if result.stderr:
+                                print(f"[ESM Error] {result.stderr.strip()}")
+                            success = result.returncode == 0 and os.path.exists(pdb_path)
+                        except Exception as e:
+                            print(f"    ESM backbone external failed: {e}")
+                            success = False
+                    else:
+                        try:
+                            info = predict_structure_with_esm(
+                                fasta_path=args.input,
+                                ss_path=ss_path,
+                                output_pdb_path=pdb_path,
+                                model_path=None,
+                                npz_output_path=npz_path,
+                                backend=args.backend,
+                            )
+                            backend_used = info.get("backend")
+                            device_used = info.get("device")
+                            if backend_used or device_used:
+                                print(f"    ESM backend={backend_used} device={device_used}")
+                            success = os.path.exists(pdb_path)
+                        except Exception as e:
+                            print(f"    ESM backbone generation failed: {e}")
+                elif args.igpu:
                     if args.igpu_env:
                         # Use process isolation for iGPU env
                         print(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU via external env '{args.igpu_env}')...")
@@ -372,7 +468,6 @@ def main():
                                 cmd_str = " ".join(cmd_list)
 
                         try:
-                            import subprocess
                             use_shell = (sys.platform == "win32")
                             env_vars = os.environ.copy()
                             env_vars["PYTHONIOENCODING"] = "utf-8"
@@ -524,14 +619,32 @@ def main():
             s = (pattern * ((L // len(pattern)) + 1))[:L]
             suffix = "fallback_model"
             pdb_name = f"{prefix}_{suffix}.pdb"
-            # Fallback model often uses default pattern SS, which can be refined.
-            # But here suffix is "fallback_model".
-            # The logic below uses suffix for refined name: "{prefix}_{suffix}_refined.pdb"
-            # Wait, pdb_name definition seems correct.
             pdb_path = os.path.join(three_d_dir, pdb_name)
             
             success = False
-            if args.igpu:
+            if getattr(args, "esm_backbone", False):
+                print(f"  > Fallback: Generating backbone via ESM model (backend={args.backend})...")
+                ss_path = os.path.join(workdir, f"{prefix}_fallback_ss.txt")
+                with open(ss_path, "w", encoding="utf-8") as f:
+                    f.write(s)
+                npz_path = os.path.join(workdir, f"{prefix}_fallback_esm.npz")
+                try:
+                    info = predict_structure_with_esm(
+                        fasta_path=args.input,
+                        ss_path=ss_path,
+                        output_pdb_path=pdb_path,
+                        model_path=None,
+                        npz_output_path=npz_path,
+                        backend=args.backend,
+                    )
+                    backend_used = info.get("backend")
+                    device_used = info.get("device")
+                    if backend_used or device_used:
+                        print(f"    ESM backend={backend_used} device={device_used}")
+                    success = os.path.exists(pdb_path)
+                except Exception as e:
+                    print(f"    ESM fallback backbone generation failed: {e}")
+            elif args.igpu:
                 if args.igpu_env:
                     # Use process isolation for iGPU env
                     print(f"  > Fallback: Optimizing backbone (iGPU via external env '{args.igpu_env}')...")
@@ -560,7 +673,6 @@ def main():
                             cmd_str = " ".join(cmd_list)
 
                     try:
-                        import subprocess
                         use_shell = (sys.platform == "win32")
                         result = subprocess.run(
                             cmd_str if sys.platform == "win32" else cmd_list,

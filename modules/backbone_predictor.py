@@ -41,6 +41,14 @@ def ss_to_phi_psi(ss, sequence=None):
             if aa == "G":
                 p = -120.0 + np.random.uniform(-30.0, 30.0)
                 s = 130.0 + np.random.uniform(-30.0, 30.0)
+            elif aa in ("V", "I", "L"):
+                r = np.random.rand()
+                if r < 0.3:
+                    p = -60.0 + np.random.uniform(-20.0, 20.0)
+                    s = -45.0 + np.random.uniform(-20.0, 20.0)
+                else:
+                    p = -120.0 + np.random.uniform(-20.0, 20.0)
+                    s = 130.0 + np.random.uniform(-20.0, 20.0)
             else:
                 r = np.random.rand()
                 if r < 0.6 and aa != "P":
@@ -75,6 +83,13 @@ def _rama_loss(phi, psi, sequence):
     if len(phi) == 0:
         return 0.0
     loss = 0.0
+    residue_weights = {
+        "V": 1.3,
+        "I": 1.3,
+        "L": 1.3,
+        "G": 0.8,
+        "P": 1.5,
+    }
     for i in range(len(phi)):
         aa = sequence[i] if i < len(sequence) else "A"
         grp = "General"
@@ -86,8 +101,99 @@ def _rama_loss(phi, psi, sequence):
         sigma = _RAMA_SIGMA[grp]
         dp = _wrap_pi(phi[i] - centers[:, 0]) / sigma[0]
         dq = _wrap_pi(psi[i] - centers[:, 1]) / sigma[1]
-        loss += float(np.min(dp * dp + dq * dq))
+        weight = residue_weights.get(aa, 1.0)
+        loss += float(np.min(dp * dp + dq * dq) * weight)
     return loss
+
+def _ss_loss(phi, psi, ss, sequence):
+    if len(phi) == 0:
+        return 0.0
+    n = min(len(phi), len(psi), len(ss), len(sequence))
+    if n == 0:
+        return 0.0
+    phi = np.asarray(phi, dtype=float)
+    psi = np.asarray(psi, dtype=float)
+    loss = 0.0
+    for i in range(n):
+        label = ss[i]
+        aa = sequence[i]
+        if label == "H":
+            tp = math.radians(-57.0)
+            ts = math.radians(-47.0)
+            sp = math.radians(20.0)
+            sq = math.radians(20.0)
+        elif label == "E":
+            tp = math.radians(-119.0)
+            ts = math.radians(113.0)
+            sp = math.radians(25.0)
+            sq = math.radians(25.0)
+        else:
+            continue
+        dp = _wrap_pi(phi[i] - tp) / sp
+        dq = _wrap_pi(psi[i] - ts) / sq
+        w = 1.0
+        if aa in ("V", "I", "L"):
+            w = 1.2
+        elif aa in ("G", "P"):
+            w = 0.8
+        loss += w * (dp * dp + dq * dq)
+    return float(loss)
+
+def _beta_pair_loss(CA_chain, ss_chain):
+    if CA_chain is None or len(CA_chain) == 0:
+        return 0.0
+    n = min(len(CA_chain), len(ss_chain))
+    if n < 2:
+        return 0.0
+    idxs = [i for i in range(n) if ss_chain[i] == "E"]
+    if len(idxs) < 2:
+        return 0.0
+    coords = CA_chain[idxs]
+    diff = coords[:, None, :] - coords[None, :, :]
+    dist = np.linalg.norm(diff, axis=2) + 1e-9
+    idxs_arr = np.array(idxs, dtype=int)
+    sep = np.abs(idxs_arr[:, None] - idxs_arr[None, :])
+    mask = sep > 3
+    dist_sel = dist[mask]
+    if dist_sel.size == 0:
+        return 0.0
+    d0 = 5.5
+    width = 1.5
+    e_dist = float(np.mean(((dist_sel - d0) / width) ** 2))
+    tangents = []
+    for i in range(n):
+        if ss_chain[i] != "E":
+            tangents.append(None)
+            continue
+        if 0 < i < n - 1:
+            v = CA_chain[i + 1] - CA_chain[i - 1]
+        elif i < n - 1:
+            v = CA_chain[i + 1] - CA_chain[i]
+        else:
+            v = CA_chain[i] - CA_chain[i - 1]
+        norm = np.linalg.norm(v)
+        if norm < 1e-6:
+            tangents.append(None)
+        else:
+            tangents.append(v / norm)
+    tvecs = []
+    for i in idxs:
+        t = tangents[i]
+        if t is None:
+            continue
+        tvecs.append(t)
+    if len(tvecs) < 2:
+        return e_dist
+    tvecs = np.stack(tvecs, axis=0)
+    dot = np.matmul(tvecs, tvecs.T)
+    dot = np.clip(dot, -1.0, 1.0)
+    m = np.triu(np.ones(dot.shape, dtype=bool), k=1)
+    vals = (np.abs(dot[m]) - 1.0) ** 2
+    if vals.size == 0:
+        e_orient = 0.0
+    else:
+        e_orient = float(np.mean(vals))
+    return float(e_dist + 0.3 * e_orient)
 
 def _normalize(v):
     n = np.linalg.norm(v)
@@ -335,6 +441,51 @@ def _apply_transform(coords, trans, rot_angles):
     R = _rotation_matrix(*rot_angles)
     return (coords @ R.T) + trans
 
+def _sidechain_contact_loss(sequence_all, dist_matrix):
+    n = len(sequence_all)
+    if n == 0:
+        return 0.0
+    if dist_matrix.shape[0] != n or dist_matrix.shape[1] != n:
+        return 0.0
+    seq = sequence_all
+    hyd_set = set(["A", "V", "I", "L", "M", "F", "W", "Y"])
+    pos_set = set(["K", "R", "H"])
+    neg_set = set(["D", "E"])
+    hyd_mask = np.array([aa in hyd_set for aa in seq], dtype=bool)
+    pos_mask = np.array([aa in pos_set for aa in seq], dtype=bool)
+    neg_mask = np.array([aa in neg_set for aa in seq], dtype=bool)
+    idx = np.triu_indices(n, k=2)
+    dists = dist_matrix[idx]
+    pair_mask = np.ones_like(dists, dtype=bool)
+    e_hh = 0.0
+    if np.any(hyd_mask):
+        hh_full = np.outer(hyd_mask, hyd_mask)
+        hh = hh_full[idx]
+        hh &= pair_mask
+        hh_d = dists[hh]
+        hh_d = hh_d[(hh_d > 3.5) & (hh_d < 12.0)]
+        if hh_d.size > 0:
+            d0 = 6.0
+            width = 2.0
+            e_hh = float(np.mean(((hh_d - d0) / width) ** 2))
+    like_full = np.outer(pos_mask, pos_mask) | np.outer(neg_mask, neg_mask)
+    like = like_full[idx]
+    like_d = dists[like]
+    like_d = like_d[like_d < 10.0]
+    e_like = 0.0
+    if like_d.size > 0:
+        e_like = float(np.mean(np.exp(-(like_d / 4.0) ** 2)))
+    salt_full = np.outer(pos_mask, neg_mask) | np.outer(neg_mask, pos_mask)
+    salt = salt_full[idx]
+    salt_d = dists[salt]
+    salt_d = salt_d[(salt_d > 2.5) & (salt_d < 8.0)]
+    e_salt = 0.0
+    if salt_d.size > 0:
+        d0 = 4.0
+        width = 1.5
+        e_salt = float(np.mean(1.0 - np.exp(-((salt_d - d0) ** 2) / (2.0 * (width ** 2)))))
+    return e_hh + e_like + e_salt
+
 def _objective_joint(x, chain_data, total_residues):
     phi_all = x[:total_residues]
     psi_all = x[total_residues : 2*total_residues]
@@ -345,6 +496,9 @@ def _objective_joint(x, chain_data, total_residues):
     rb_idx = 0
     t_ang = 0.0
     t_rama = 0.0
+    t_ss = 0.0
+    t_beta = 0.0
+    seq_concat = []
     
     for i, (seq, ss, phi_ref, psi_ref) in enumerate(chain_data):
         n = len(seq)
@@ -365,7 +519,11 @@ def _objective_joint(x, chain_data, total_residues):
             t_rama += _rama_loss(phi, psi, seq)
         except Exception:
             pass
-        
+        try:
+            t_ss += _ss_loss(phi, psi, ss, seq)
+        except Exception:
+            pass
+    
         try:
             N_c, CA_c, C_c = build_backbone(seq, phi, psi)
         except:
@@ -381,6 +539,11 @@ def _objective_joint(x, chain_data, total_residues):
             C_c = _apply_transform(C_c, trans, rot)
             
         all_CA.append(CA_c)
+        try:
+            t_beta += _beta_pair_loss(CA_c, ss)
+        except Exception:
+            pass
+        seq_concat.append(seq)
         
     full_CA = np.concatenate(all_CA)
     centroid = np.mean(full_CA, axis=0)
@@ -396,8 +559,11 @@ def _objective_joint(x, chain_data, total_residues):
         t_clash = np.sum((3.5 - dists[clash_mask]) ** 2)
     else:
         t_clash = 0.0
+    
+    sequence_all = "".join(seq_concat)
+    t_side = _sidechain_contact_loss(sequence_all, dd)
         
-    return 0.5 * rg2 + 10.0 * t_clash + 5.0 * t_ang + 3.0 * t_rama
+    return 0.5 * rg2 + 10.0 * t_clash + 5.0 * t_ang + 4.0 * t_rama + 2.0 * t_ss + 3.0 * t_beta + 1.5 * t_side
 
 def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
     if not chain_ss_list: return False

@@ -1,16 +1,20 @@
 numpy>=1.24.0
-requests>=2.28.0
-volcengine>=1.0.0
+scipy
 torch>=2.0.0
-# 可选：Windows iGPU 跨平台加速（Intel/AMD/NVIDIA）建议在 Windows 安装
-# torch-directml>=0.1.13
+requests>=2.28.0
 pybiomed>=1.0
+biopython
 tqdm>=4.65.0
 flask>=2.2.0
 flask-cors>=3.0.0
 colorama>=0.4.6
 py-cpuinfo>=9.0.0
+esm
+# 可选：Windows iGPU 跨平台加速（Intel/AMD/NVIDIA）建议在 Windows 安装
+# torch-directml>=0.1.13
 # 可选：OpenMM 用于后处理（能量最小化/微型 MD），推荐用 conda 安装
 # openmm
 # 可选：Intel IPEX（Intel XPU/Arc/Ultra 加速），需额外索引安装，建议手动安装
 # intel-extension-for-pytorch
+# 可选：Ark 官方 SDK，如需直接使用 volcengine 客户端
+# volcengine>=1.0.0

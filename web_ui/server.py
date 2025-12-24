@@ -625,10 +625,10 @@ def run_minifold(data):
         
         state.add_log(f"Saved FASTA to {fasta_path}", "INFO")
 
-        # Execute pipeline
-        # Check for Global Environment Override
         use_global_env = bool(data.get("useGlobalEnv") and data.get("globalEnvName"))
         global_env_name = data.get("globalEnvName")
+        use_direct_3d = bool(data.get("direct3D"))
+        direct_ss_dir = data.get("ssDir")
 
         def logger(msg: str):
             text = str(msg).strip()
@@ -674,6 +674,8 @@ def run_minifold(data):
             state.add_log(text, "INFO")
 
         if use_global_env:
+            if use_direct_3d:
+                state.add_log("Direct 3D mode currently仅支持本地内置环境运行，已忽略全局环境设置。", "WARNING")
             state.add_log(f"Running in external environment: {global_env_name}", "INFO")
             
             # Construct command for minifold.py
@@ -704,6 +706,11 @@ def run_minifold(data):
                 cmd_args.append("--npu")
                 if bool(data.get("useNpuEnv") and data.get("npuEnvName")):
                     cmd_args.extend(["--npu-env", data.get("npuEnvName")])
+            
+            if bool(data.get("useEsmBackbone")):
+                cmd_args.append("--esm-backbone")
+                if bool(data.get("useEsmEnv") and data.get("esmEnvName")):
+                    cmd_args.extend(["--esm-env", data.get("esmEnvName")])
             
             # Pass target chains if present
             target_chains_val = data.get("targetChains")
@@ -787,11 +794,12 @@ def run_minifold(data):
             # Execute pipeline in-process (Original Logic)
             try:
                 ensure_local_modules_package()
-                # Force reload modules to ensure latest code changes apply without server restart
                 use_ext_env = bool(data.get("useIgpuEnv") and data.get("igpuEnvName"))
                 use_igpu = bool(data.get("useIgpu"))
                 use_npu = bool(data.get("useNpu"))
                 use_npu_ext_env = bool(data.get("useNpuEnv") and data.get("npuEnvName"))
+                use_esm = bool(data.get("useEsmBackbone"))
+                use_esm_ext_env = bool(use_esm and data.get("useEsmEnv") and data.get("esmEnvName"))
                 import modules.pipeline
                 import modules.input_handler
                 importlib.reload(modules.input_handler)
@@ -826,7 +834,12 @@ def run_minifold(data):
                     log_callback=logger,
                     use_npu=use_npu,
                     use_npu_ext_env=use_npu_ext_env,
-                    npu_ext_env_name=(data.get("npuEnvName") if use_npu_ext_env else None)
+                    npu_ext_env_name=(data.get("npuEnvName") if use_npu_ext_env else None),
+                    use_esm=use_esm,
+                    use_esm_ext_env=use_esm_ext_env,
+                    esm_ext_env_name=(data.get("esmEnvName") if use_esm_ext_env else None),
+                    direct_3d=use_direct_3d,
+                    direct_ss_dir=direct_ss_dir,
                 )
                 state.set_status("completed")
                 state.update_progress(100, "Completed")

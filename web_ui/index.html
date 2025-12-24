@@ -136,7 +136,7 @@
 
                         <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-3">
                             <div class="flex items-center justify-between">
-                                <label class="text-sm font-medium text-gray-700">iGPU Acceleration</label>
+                                <label class="text-sm font-medium text-gray-700">Acceleration</label>
                                 <input type="checkbox" id="useIgpu" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
                             </div>
                             <div id="igpuEnvConfig" class="hidden space-y-2 border-t border-gray-200 pt-2 mt-2">
@@ -173,6 +173,41 @@
                                 <div id="npuEnvInput" class="space-y-1">
                                     <input type="text" id="npuEnvName" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="NPU Conda env name (e.g. MiniFold_NPU)">
                                 </div>
+                            </div>
+                        </div>
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-3">
+                            <div class="flex items-center justify-between">
+                                <label class="text-sm font-medium text-gray-700">ESM 3D Model (pt)</label>
+                                <input type="checkbox" id="useEsmBackbone" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                            </div>
+                            <div id="esmEnvConfig" class="hidden space-y-2 border-t border-gray-200 pt-2 mt-2">
+                                <div class="flex items-center gap-2 pt-1">
+                                    <input type="checkbox" id="useEsmEnv" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500" checked>
+                                    <label class="text-xs text-gray-600">Use Separate Environment for ESM</label>
+                                </div>
+                                <div id="esmEnvInput" class="space-y-1">
+                                    <input type="text" id="esmEnvName" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="ESM Conda env name or python path">
+                                </div>
+                            </div>
+                            <p class="text-xs text-gray-500">Use 3d_moudel/best_model_gpu.pt via ESM in selected environment.</p>
+                        </div>
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-3">
+                            <div class="flex items-center justify-between">
+                                <label class="text-sm font-medium text-gray-700">Direct 3D Mode</label>
+                                <input type="checkbox" id="direct3D" class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500">
+                            </div>
+                            <p class="text-xs text-gray-500">Skip SS generation and voting, use existing secondary structure files for 3D.</p>
+                            <div id="direct3DConfig" class="hidden space-y-2 border-t border-gray-200 pt-2 mt-2">
+                                <div class="space-y-1">
+                                    <label class="block text-xs font-medium text-gray-700">Secondary Structure Folder</label>
+                                    <div class="flex gap-2">
+                                        <input type="text" id="ssDir" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-xs" placeholder="Folder containing *.txt secondary structure files">
+                                        <button id="browseSsDirBtn" class="px-2 py-2 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg text-gray-600 transition-colors" title="Browse Folder">
+                                            <i class="fa-solid fa-folder-open text-xs"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                <p class="text-xs text-gray-500">Each file should be a H/E/C string matching the FASTA length.</p>
                             </div>
                         </div>
                     </div>
@@ -362,6 +397,21 @@
             }
         });
 
+        const browseSsDirBtn = document.getElementById('browseSsDirBtn');
+        if (browseSsDirBtn) {
+            browseSsDirBtn.addEventListener('click', async () => {
+                try {
+                    const res = await fetch('/api/browse-dir', { method: 'POST' });
+                    const data = await res.json();
+                    if (data.path) {
+                        document.getElementById('ssDir').value = data.path;
+                    }
+                } catch (e) {
+                    alert("Directory browsing is only available when running locally with GUI support.");
+                }
+            });
+        }
+
         // Toggle Global Env
         document.getElementById('useGlobalEnv').addEventListener('change', (e) => {
             const config = document.getElementById('globalEnvConfig');
@@ -371,6 +421,14 @@
         // Toggle iGPU Env
         document.getElementById('useIgpu').addEventListener('change', (e) => {
             const config = document.getElementById('igpuEnvConfig');
+            const esmToggle = document.getElementById('useEsmBackbone');
+            const esmConfig = document.getElementById('esmEnvConfig');
+            if (e.target.checked && esmToggle && esmToggle.checked) {
+                esmToggle.checked = false;
+                if (esmConfig) {
+                    esmConfig.classList.add('hidden');
+                }
+            }
             e.target.checked ? config.classList.remove('hidden') : config.classList.add('hidden');
         });
 
@@ -386,6 +444,42 @@
             const input = document.getElementById('npuEnvInput');
             e.target.checked ? input.classList.remove('hidden') : input.classList.add('hidden');
         });
+
+        const useEsmBackboneEl = document.getElementById('useEsmBackbone');
+        const esmEnvConfigEl = document.getElementById('esmEnvConfig');
+        const useEsmEnvEl = document.getElementById('useEsmEnv');
+        const esmEnvInputEl = document.getElementById('esmEnvInput');
+        const direct3DEl = document.getElementById('direct3D');
+        const direct3DConfigEl = document.getElementById('direct3DConfig');
+
+        if (useEsmBackboneEl && esmEnvConfigEl) {
+            useEsmBackboneEl.addEventListener('change', (e) => {
+                const checked = e.target.checked;
+                if (checked) {
+                    const igpuToggle = document.getElementById('useIgpu');
+                    const igpuConfig = document.getElementById('igpuEnvConfig');
+                    if (igpuToggle) {
+                        igpuToggle.checked = false;
+                    }
+                    if (igpuConfig) {
+                        igpuConfig.classList.add('hidden');
+                    }
+                }
+                checked ? esmEnvConfigEl.classList.remove('hidden') : esmEnvConfigEl.classList.add('hidden');
+            });
+        }
+
+        if (useEsmEnvEl && esmEnvInputEl) {
+            useEsmEnvEl.addEventListener('change', (e) => {
+                e.target.checked ? esmEnvInputEl.classList.remove('hidden') : esmEnvInputEl.classList.add('hidden');
+            });
+        }
+
+        if (direct3DEl && direct3DConfigEl) {
+            direct3DEl.addEventListener('change', (e) => {
+                e.target.checked ? direct3DConfigEl.classList.remove('hidden') : direct3DConfigEl.classList.add('hidden');
+            });
+        }
 
         // Run Job
         // Logic moved to startJobHandler
@@ -781,29 +875,37 @@
         async function startJobHandler(e) {
             if (e) e.preventDefault();
             
-            const data = {
-                jobName: document.getElementById('jobName').value.trim(),
-                fasta: document.getElementById('fasta').value.trim(),
-                envText: document.getElementById('envText').value.trim(),
-                ssn: parseInt(document.getElementById('ssn').value),
-                threshold: parseFloat(document.getElementById('threshold').value),
-                outDir: document.getElementById('outDir').value.trim(),
-                targetChains: document.getElementById('targetChains').value,
-                
-                useGlobalEnv: document.getElementById('useGlobalEnv').checked,
-                globalEnvName: document.getElementById('globalEnvName').value.trim(),
-                
-                useIgpu: document.getElementById('useIgpu').checked,
-                backend: document.getElementById('backend').value,
-                useIgpuEnv: document.getElementById('useIgpuEnv').checked,
-                igpuEnvName: document.getElementById('igpuEnvName').value.trim(),
-                useNpu: document.getElementById('useNpu').checked,
-                useNpuEnv: document.getElementById('useNpuEnv').checked,
-                npuEnvName: document.getElementById('npuEnvName').value.trim()
-            };
+                const data = {
+                    jobName: document.getElementById('jobName').value.trim(),
+                    fasta: document.getElementById('fasta').value.trim(),
+                    envText: document.getElementById('envText').value.trim(),
+                    ssn: parseInt(document.getElementById('ssn').value),
+                    threshold: parseFloat(document.getElementById('threshold').value),
+                    outDir: document.getElementById('outDir').value.trim(),
+                    targetChains: document.getElementById('targetChains').value,
+                    useGlobalEnv: document.getElementById('useGlobalEnv').checked,
+                    globalEnvName: document.getElementById('globalEnvName').value.trim(),
+                    useIgpu: document.getElementById('useIgpu').checked,
+                    backend: document.getElementById('backend').value,
+                    useIgpuEnv: document.getElementById('useIgpuEnv').checked,
+                    igpuEnvName: document.getElementById('igpuEnvName').value.trim(),
+                    useNpu: document.getElementById('useNpu').checked,
+                    useNpuEnv: document.getElementById('useNpuEnv').checked,
+                    npuEnvName: document.getElementById('npuEnvName').value.trim(),
+                    useEsmBackbone: document.getElementById('useEsmBackbone').checked,
+                    useEsmEnv: document.getElementById('useEsmEnv').checked,
+                    esmEnvName: document.getElementById('esmEnvName').value.trim(),
+                    direct3D: document.getElementById('direct3D').checked,
+                    ssDir: document.getElementById('ssDir').value.trim()
+                };
 
             if (!data.fasta) {
                 alert("Please enter FASTA sequence.");
+                return;
+            }
+
+            if (data.direct3D && !data.ssDir) {
+                alert("Please choose a secondary structure folder for Direct 3D Mode.");
                 return;
             }
 
