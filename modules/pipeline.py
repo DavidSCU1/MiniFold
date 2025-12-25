@@ -458,6 +458,14 @@ def run_pipeline(
                             except Exception as e:
                                 success = False
                                 log_callback(f"    ESM backbone generation failed: {e}")
+                        
+                        if use_esm and not success:
+                            log_callback("    ESM backbone failed, falling back to Standard optimizer...")
+                            try:
+                                success = run_backbone_fold_multichain(sequence, chains, pdb_path)
+                            except Exception as e:
+                                success = False
+                                log_callback(f"    Standard backbone fallback failed: {e}")
                     elif auto_igpu:
                         if use_ext_env and ext_env_name:
                             log_callback(f"  > Case {case_idx} (p={prob:.2f}): Optimizing backbone (iGPU via external env '{ext_env_name}')...")

@@ -1,63 +1,7 @@
 import os
 import sys
 import json
-import numpy as np
 import torch
-import importlib
-import importlib.util
-
-esm = None
-
-
-def _ensure_esm_loaded():
-    global esm
-    if esm is not None:
-        return
-    try:
-        import esm as _esm
-
-        esm = _esm
-        return
-    except Exception:
-        pass
-    try:
-        hub_dir = torch.hub.get_dir()
-        repo_dir = os.path.join(hub_dir, "facebookresearch_esm_main")
-        init_path = os.path.join(repo_dir, "esm", "__init__.py")
-        if os.path.exists(init_path):
-            spec = importlib.util.spec_from_file_location("esm", init_path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules["esm"] = module
-            spec.loader.exec_module(module)
-            esm = module
-            return
-    except Exception:
-        pass
-    esm = None
-
-
-def _load_esm2_model():
-    _ensure_esm_loaded()
-    if esm is not None:
-        pretrained_mod = getattr(esm, "pretrained", None)
-        if pretrained_mod is not None and hasattr(pretrained_mod, "esm2_t33_650M_UR50D"):
-            return pretrained_mod.esm2_t33_650M_UR50D()
-    raise RuntimeError(
-        "ESM-2 model definition not available. Ensure either fair-esm is installed\n"
-        "or torch.hub has cloned facebookresearch/esm into the local cache."
-    )
-
-
-def _load_esmfold_core():
-    _ensure_esm_loaded()
-    if esm is not None:
-        pretrained_mod = getattr(esm, "pretrained", None)
-        if pretrained_mod is not None and hasattr(pretrained_mod, "esmfold_v1"):
-            return pretrained_mod.esmfold_v1()
-    raise RuntimeError(
-        "ESMFold model definition not available. Ensure either fair-esm is installed\n"
-        "or torch.hub has cloned facebookresearch/esm into the local cache."
-    )
 
 
 def select_device(backend="auto"):
@@ -119,32 +63,8 @@ def load_ss_from_file(ss_path):
     return text
 
 
-def generate_npz_from_esm(fasta_path, ss_path, npz_output_path, backend="auto"):
-    sequence = load_sequence_from_fasta(fasta_path)
-    ss_text = load_ss_from_file(ss_path) if ss_path else None
-    device, actual_backend = select_device(backend)
-    esm_model, alphabet = _load_esm2_model()
-    esm_model = esm_model.to(device)
-    esm_model.eval()
-    batch_converter = alphabet.get_batch_converter()
-    data = [("protein", sequence)]
-    _, _, tokens = batch_converter(data)
-    tokens = tokens.to(device)
-    with torch.no_grad():
-        out = esm_model(tokens, repr_layers=[33], return_contacts=False)
-        rep = out["representations"][33].cpu().numpy()
-    tokens_np = tokens.cpu().numpy()
-    ss_arr = None
-    if ss_text:
-        ss_arr = np.frombuffer(ss_text.encode("utf-8"), dtype=np.uint8)
-    os.makedirs(os.path.dirname(os.path.abspath(npz_output_path)), exist_ok=True)
-    np.savez(npz_output_path, tokens=tokens_np, representation=rep, ss=ss_arr, backend=actual_backend)
-    return {"backend": actual_backend}
-
-
 def load_esmfold_model(model_path=None, backend="auto"):
     device, actual_backend = select_device(backend)
-    model, alphabet = _load_esmfold_core()
     ckpt_path = model_path
     if ckpt_path is None:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -153,13 +73,17 @@ def load_esmfold_model(model_path=None, backend="auto"):
             ckpt_path_legacy = os.path.join(root, "3d_moudel", "best_model_gpu.pt")
             if os.path.exists(ckpt_path_legacy):
                 ckpt_path = ckpt_path_legacy
-    if ckpt_path and os.path.exists(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device)
-        if isinstance(state, dict):
-            model.load_state_dict(state, strict=False)
-    model = model.to(device)
-    model.eval()
-    return model, alphabet, device, actual_backend
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        raise RuntimeError("ESM model checkpoint not found.")
+    state = torch.load(ckpt_path, map_location="cpu")
+    if hasattr(state, "infer_pdb"):
+        model = state
+    else:
+        raise RuntimeError("ESM checkpoint must be a full model object with infer_pdb.")
+    if isinstance(model, torch.nn.Module):
+        model = model.to(device)
+        model.eval()
+    return model, None, device, actual_backend
 
 
 def predict_structure_with_esm(
@@ -171,8 +95,6 @@ def predict_structure_with_esm(
     backend="auto",
 ):
     sequence = load_sequence_from_fasta(fasta_path)
-    if npz_output_path:
-        generate_npz_from_esm(fasta_path, ss_path, npz_output_path, backend=backend)
     model, alphabet, device, actual_backend = load_esmfold_model(
         model_path=model_path, backend=backend
     )
@@ -197,12 +119,16 @@ if __name__ == "__main__":
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--model", default=None)
     args = parser.parse_args()
-    info = predict_structure_with_esm(
-        fasta_path=args.fasta,
-        ss_path=args.ss,
-        output_pdb_path=args.output,
-        model_path=args.model,
-        npz_output_path=args.npz,
-        backend=args.backend,
-    )
-    print(json.dumps(info))
+    try:
+        info = predict_structure_with_esm(
+            fasta_path=args.fasta,
+            ss_path=args.ss,
+            output_pdb_path=args.output,
+            model_path=args.model,
+            npz_output_path=args.npz,
+            backend=args.backend,
+        )
+        print(json.dumps(info))
+    except Exception as e:
+        print(f"[ESM Runner] Error: {e}", file=sys.stderr)
+        sys.exit(1)

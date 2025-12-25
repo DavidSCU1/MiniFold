@@ -766,7 +766,9 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
     cys_indices = torch.nonzero(aa_indices == MJ_INDEX["C"]).flatten()
     
     opt_phase = "coarse"
+    last_loss_breakdown = None
     def calc_loss():
+        nonlocal last_loss_breakdown
         all_N, all_CA, all_C, all_O, all_H, all_CB = [], [], [], [], [], []
         loss_ss = torch.tensor(0.0, device=device)
         loss_rama = torch.tensor(0.0, device=device)
@@ -1178,7 +1180,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 loss_beta * w_beta +
                 loss_hydro_collapse * w_hydro_collapse + loss_charged_clash * w_charged_clash)
         
-        # Universal Constraints
         loss_constraints = torch.tensor(0.0, device=device)
         if constraints:
             for c in constraints:
@@ -1186,29 +1187,24 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                     c_type = c.get("type")
                     strength = float(c.get("strength", 5.0))
                     indices = c.get("indices", [])
-                    if not indices: continue
-                    
-                    # Filter indices to valid range
+                    if not indices:
+                        continue
                     valid_indices = [idx for idx in indices if idx < len(full_CB)]
-                    if not valid_indices: continue
-                    
+                    if not valid_indices:
+                        continue
                     t_indices = torch.tensor(valid_indices, device=device, dtype=torch.long)
-                    
                     if c_type == "distance_point":
-                        # Logic: Pull selected residues towards their common centroid (simulating coordination center)
                         target_residues = full_CB[t_indices]
                         center = torch.mean(target_residues, dim=0)
                         dists = torch.norm(target_residues - center, dim=1)
                         target_dist = float(c.get("distance", 3.0)) 
                         loss_constraints = loss_constraints + strength * torch.sum((dists - target_dist)**2)
-                        
                     elif c_type == "pocket_preservation":
                         target_residues = full_CB[t_indices]
                         center = torch.mean(target_residues, dim=0)
                         rg_sq = torch.sum((target_residues - center)**2) / len(target_residues)
                         target_radius = float(c.get("radius", 10.0))
                         loss_constraints = loss_constraints + strength * (torch.sqrt(rg_sq + 1e-6) - target_radius)**2
-                        
                     elif c_type == "surface_exposure":
                         is_exposed = c.get("exposed", True)
                         target_vals = exposure[t_indices]
@@ -1216,7 +1212,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                             loss_constraints = loss_constraints + strength * torch.sum((1.0 - target_vals)**2)
                         else:
                             loss_constraints = loss_constraints + strength * torch.sum(target_vals**2)
-                            
                     elif c_type == "interface_geometry":
                         geo_type = c.get("geometry_type", "planar")
                         if geo_type == "planar":
@@ -1229,13 +1224,31 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                                     eigs = torch.linalg.eigvalsh(cov)
                                     min_eig = eigs[0] 
                                     loss_constraints = loss_constraints + strength * min_eig
-                                except:
+                                except Exception:
                                     pass
                 except Exception:
                     pass
         
-        # Use safe addition to handle potential shape mismatches (scalar vs [1])
         loss = loss + loss_constraints
+        per_res = float(total_residues)
+        if per_res <= 0.0:
+            per_res = 1.0
+        try:
+            last_loss_breakdown = {
+                "total": loss.detach(),
+                "per_res": (loss / per_res).detach(),
+                "ss": (loss_ss * w_ss).detach(),
+                "rama": (loss_rama * w_rama).detach(),
+                "beta": (loss_beta * w_beta).detach(),
+                "hydro": (loss_hydro * w_hydro).detach(),
+                "mj": (loss_mj * w_mj).detach(),
+                "elec": (loss_elec * w_elec).detach(),
+                "rg": (loss_rg_target * w_rg_tgt).detach(),
+                "hb": (hb_energy * w_hb).detach(),
+                "constraints": loss_constraints.detach(),
+            }
+        except Exception:
+            last_loss_breakdown = None
         return loss
 
         if num_chains == 1:
@@ -1400,19 +1413,23 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
     
     strategies = ["bio_hydro_collapse", "bio_consensus", "bio_rama_sampling"]
     
-    # Check for fast mode env var
     if os.environ.get("MINIFOLD_FAST_MODE", "0") == "1":
         strategies = ["bio_hydro_collapse"]
         logger.info("Fast Mode Enabled: Running 'Hydrophobic Collapse' strategy only.")
-
+    
     try:
         starts_override = int(os.environ.get("MINIFOLD_IGPU_NUM_STARTS", "0"))
     except Exception:
         starts_override = 0
     if starts_override > 0:
         strategies = strategies[: max(1, min(starts_override, len(strategies)))]
-
+    
     num_starts = len(strategies)
+    try:
+        restarts_per_strategy = int(os.environ.get("MINIFOLD_IGPU_RESTARTS", "1"))
+    except Exception:
+        restarts_per_strategy = 1
+    restarts_per_strategy = max(1, restarts_per_strategy)
 
     best_loss = None
     best_phi = None
@@ -1435,161 +1452,185 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         return geo_c, hydro_c
 
     for s, strategy in enumerate(strategies):
-        logger.info(f"  > Start {s+1}/{num_starts}: Strategy '{strategy}'")
-        
-        with torch.no_grad():
-            # 1. Initialize Angles (Phi/Psi)
-            for i, d in enumerate(chain_data):
-                if strategy == "bio_rama_sampling":
-                    new_phi, new_psi = ss_to_phi_psi_tensor(d["ss"], d["seq"])
-                    phi_params[i].copy_(new_phi.to(device))
-                    psi_params[i].copy_(new_psi.to(device))
-                else:
-                    # Consensus / Hydrophobic: Use Ideal SS (Clean Start)
-                    # Small noise to break symmetry
-                    phi_params[i].copy_(d["phi_ref"] + (torch.rand_like(d["phi_ref"]) - 0.5) * 0.05)
-                    psi_params[i].copy_(d["psi_ref"] + (torch.rand_like(d["psi_ref"]) - 0.5) * 0.05)
-                o0 = torch.full_like(phi_params[i], math.pi)
-                prepro_mask = d.get("prepro_mask")
-                if prepro_mask is not None and prepro_mask.numel() == o0.numel():
-                    cis_sample = (torch.rand_like(o0) < 0.05) & (prepro_mask > 0.5)
-                    o0 = torch.where(cis_sample, torch.zeros_like(o0), o0)
-                omega_params[i].copy_(o0)
+        for restart_idx in range(restarts_per_strategy):
+            logger.info(f"  > Start {s+1}/{num_starts}, Restart {restart_idx+1}/{restarts_per_strategy}: Strategy '{strategy}'")
+            
+            with torch.no_grad():
+                for i, d in enumerate(chain_data):
+                    if strategy == "bio_rama_sampling":
+                        new_phi, new_psi = ss_to_phi_psi_tensor(d["ss"], d["seq"])
+                        phi_params[i].copy_(new_phi.to(device))
+                        psi_params[i].copy_(new_psi.to(device))
+                    else:
+                        phi_params[i].copy_(d["phi_ref"] + (torch.rand_like(d["phi_ref"]) - 0.5) * 0.05)
+                        psi_params[i].copy_(d["psi_ref"] + (torch.rand_like(d["psi_ref"]) - 0.5) * 0.05)
+                    o0 = torch.full_like(phi_params[i], math.pi)
+                    prepro_mask = d.get("prepro_mask")
+                    if prepro_mask is not None and prepro_mask.numel() == o0.numel():
+                        cis_sample = (torch.rand_like(o0) < 0.05) & (prepro_mask > 0.5)
+                        o0 = torch.where(cis_sample, torch.zeros_like(o0), o0)
+                    omega_params[i].copy_(o0)
+            
+                if rb_params is not None:
+                    init_rb = []
+                    c0_geo, c0_hydro = get_chain_props(chain_data[0], phi_params[0], psi_params[0], omega_params[0])
+                    for k in range(1, len(chain_data)):
+                        ck_geo, ck_hydro = get_chain_props(chain_data[k], phi_params[k], psi_params[k], omega_params[k])
+                        if strategy == "bio_hydro_collapse":
+                            offset = (torch.rand(3, device=device) - 0.5) * 5.0
+                            t = (c0_hydro - ck_hydro) + offset
+                            r = (torch.rand(3, device=device) * 2 * math.pi) - math.pi
+                            init_rb.append(torch.cat([t, r]))
+                        elif strategy == "bio_consensus":
+                            t = c0_geo - ck_geo + torch.tensor([10.0 * k, 0.0, 0.0], device=device)
+                            r = torch.zeros(3, device=device)
+                            init_rb.append(torch.cat([t, r]))
+                        else:
+                            t = (torch.rand(3, device=device) * 40.0) - 20.0
+                            r = (torch.rand(3, device=device) * 2 * math.pi) - math.pi
+                            init_rb.append(torch.cat([t, r]))
+                    rb_params.copy_(torch.stack(init_rb))
 
-            # 2. Initialize Rigid Body (Multi-chain)
-            if rb_params is not None:
-                init_rb = []
-                # First chain (idx 0) is fixed at origin.
-                # Calculate its props.
-                c0_geo, c0_hydro = get_chain_props(chain_data[0], phi_params[0], psi_params[0], omega_params[0])
-                
-                for k in range(1, len(chain_data)):
-                    # Calculate current chain props at origin
-                    ck_geo, ck_hydro = get_chain_props(chain_data[k], phi_params[k], psi_params[k], omega_params[k])
-                    
-                    if strategy == "bio_hydro_collapse":
-                        # Align Hydrophobic Centers
-                        # Target: c0_hydro
-                        # Current: ck_hydro (assuming no rot/trans yet)
-                        # Translation = Target - Current
-                        # Add a small offset so they don't clash immediately
-                        offset = (torch.rand(3, device=device) - 0.5) * 5.0
-                        t = (c0_hydro - ck_hydro) + offset
-                        
-                        # Rotation: Random is okay, or face-to-face?
-                        # Let's use random for now, docking will fix it.
-                        r = (torch.rand(3, device=device) * 2 * math.pi) - math.pi
-                        init_rb.append(torch.cat([t, r]))
-                        
-                    elif strategy == "bio_consensus":
-                        # Geometric proximity
-                        # Place nearby but distinct
-                        t = c0_geo - ck_geo + torch.tensor([10.0 * k, 0.0, 0.0], device=device)
-                        r = torch.zeros(3, device=device)
-                        init_rb.append(torch.cat([t, r]))
-                        
-                    else: # bio_rama_sampling
-                        # Random exploration
-                        t = (torch.rand(3, device=device) * 40.0) - 20.0
-                        r = (torch.rand(3, device=device) * 2 * math.pi) - math.pi
-                        init_rb.append(torch.cat([t, r]))
-                        
-                rb_params.copy_(torch.stack(init_rb))
-
-        logger.info(f"  > Start {s+1}/{num_starts}: AdamW (Coarse Folding)")
-        # Use AdamW for better weight decay handling and convergence stability
-        # Use foreach=True for faster parameter updates (fused kernel)
-        opt_adam = torch.optim.AdamW(all_params, lr=0.05, weight_decay=1e-4, foreach=True)
+            logger.info(f"  > Start {s+1}/{num_starts}, Restart {restart_idx+1}/{restarts_per_strategy}: AdamW (Coarse Folding)")
+            try:
+                adam_lr = float(os.environ.get("MINIFOLD_IGPU_ADAM_LR", "0.05"))
+            except Exception:
+                adam_lr = 0.05
+            try:
+                adam_wd = float(os.environ.get("MINIFOLD_IGPU_ADAM_WD", "1e-4"))
+            except Exception:
+                adam_wd = 1e-4
+            opt_adam = torch.optim.AdamW(all_params, lr=adam_lr, weight_decay=adam_wd, foreach=True)
         
         # IPEX Optimizer Fuse (if applicable)
-        if use_ipex and ipex_mod is not None:
+            if use_ipex and ipex_mod is not None:
+                try:
+                    opt_adam, _ = ipex_mod.optimize(opt_adam, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float32, inplace=True)
+                    logger.info("  > IPEX Fused Optimizer enabled")
+                except Exception:
+                    pass
+
             try:
-                opt_adam, _ = ipex_mod.optimize(opt_adam, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float32, inplace=True)
-                logger.info("  > IPEX Fused Optimizer enabled")
+                adam_steps = int(os.environ.get("MINIFOLD_IGPU_ADAM_STEPS", "350"))
             except Exception:
-                pass
+                adam_steps = 350
+            adam_steps = max(1, adam_steps)
+            try:
+                log_every = int(os.environ.get("MINIFOLD_IGPU_LOG_EVERY", "5"))
+            except Exception:
+                log_every = 5
 
-        try:
-            adam_steps = int(os.environ.get("MINIFOLD_IGPU_ADAM_STEPS", "50"))
-        except Exception:
-            adam_steps = 150
-        adam_steps = max(1, adam_steps)
-        try:
-            log_every = int(os.environ.get("MINIFOLD_IGPU_LOG_EVERY", "5"))
-        except Exception:
-            log_every = 5
-
-        # Phase 1: Fast Coarse Folding (AdamW)
-        for step in range(adam_steps): 
-            opt_adam.zero_grad(set_to_none=True)
-            
-            # AMP Context for Intel XPU / CUDA
-            # DML support for AMP is experimental, so we skip it there for now
-            if use_ipex:
-                with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float16):
+            for step in range(adam_steps): 
+                opt_adam.zero_grad(set_to_none=True)
+                if use_ipex:
+                    with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float16):
+                        loss = calc_loss()
+                elif device.type == "cuda":
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        loss = calc_loss()
+                else:
                     loss = calc_loss()
-            elif device.type == 'cuda':
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    loss = calc_loss()
-            else:
-                loss = calc_loss()
+                loss.backward()
+                opt_adam.step()
                 
-            loss.backward()
-            opt_adam.step()
-            
-            if log_every > 0 and (step + 1) % log_every == 0:
-                 logger.info(f"[PROGRESS_DETAIL] Phase 1 (Coarse): Step {step+1}/{adam_steps} | Loss: {loss.item():.2f}")
+                if log_every > 0 and (step + 1) % log_every == 0:
+                    msg = f"[PROGRESS_DETAIL] Phase 1 (Coarse): Step {step+1}/{adam_steps} | Loss: {loss.item():.2f}"
+                    if last_loss_breakdown is not None:
+                        try:
+                            br = last_loss_breakdown
+                            msg += (
+                                f" | per_res={br.get('per_res', loss / max(1, total_residues)).item():.2f}"
+                                f", ss={br.get('ss', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", rama={br.get('rama', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", beta={br.get('beta', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", hydro={br.get('hydro', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", mj={br.get('mj', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", elec={br.get('elec', torch.tensor(0.0, device=device)).item():.1f}"
+                            )
+                        except Exception:
+                            pass
+                    logger.info(msg)
 
-            # Optimization: Skip intermediate snapshots to reduce I/O overhead
-            if step == adam_steps - 1: 
-                save_snapshot(f"adam_{s+1}_{step+1}")
+                if step == adam_steps - 1: 
+                    save_snapshot(f"adam_{s+1}_{step+1}")
                 
-        # Phase 2: Fine Refinement (LBFGS)
-        # Only run LBFGS if loss is reasonably low or as final polish
-        logger.info(f"  > Start {s+1}/{num_starts}: LBFGS (Fine Tuning)")
-        try:
-            lbfgs_max_iter = int(os.environ.get("MINIFOLD_IGPU_LBFGS_MAX_ITER", "40"))
-        except Exception:
-            lbfgs_max_iter = 480
-        lbfgs_max_iter = max(1, lbfgs_max_iter)
+            logger.info(f"  > Start {s+1}/{num_starts}, Restart {restart_idx+1}/{restarts_per_strategy}: LBFGS (Fine Tuning)")
+            try:
+                lbfgs_max_iter = int(os.environ.get("MINIFOLD_IGPU_LBFGS_MAX_ITER", "960"))
+            except Exception:
+                lbfgs_max_iter = 960
+            lbfgs_max_iter = max(1, lbfgs_max_iter)
+            try:
+                lbfgs_hist = int(os.environ.get("MINIFOLD_IGPU_LBFGS_HISTORY", "10"))
+            except Exception:
+                lbfgs_hist = 10
+            try:
+                lbfgs_tol_grad = float(os.environ.get("MINIFOLD_IGPU_LBFGS_TOL_GRAD", "1e-5"))
+            except Exception:
+                lbfgs_tol_grad = 1e-5
+            try:
+                lbfgs_tol_change = float(os.environ.get("MINIFOLD_IGPU_LBFGS_TOL_CHANGE", "1e-5"))
+            except Exception:
+                lbfgs_tol_change = 1e-5
 
-        opt_lbfgs = torch.optim.LBFGS(all_params, max_iter=lbfgs_max_iter, tolerance_grad=1e-5, tolerance_change=1e-5, history_size=10, line_search_fn="strong_wolfe")
-        
-        lbfgs_step_count = 0
-        amp_lbfgs = os.environ.get("MINIFOLD_IGPU_AMP_LBFGS", "0") == "1"
-        def closure():
-            nonlocal lbfgs_step_count
-            opt_lbfgs.zero_grad(set_to_none=True)
-            if amp_lbfgs and use_ipex:
-                with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float16):
-                    l = calc_loss()
-            elif amp_lbfgs and device.type == 'cuda':
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    l = calc_loss()
-            else:
-                l = calc_loss()
-            l.backward()
-            lbfgs_step_count += 1
-            # Optimization: Only snapshot at the end or very rarely
-            if log_every > 0 and lbfgs_step_count % log_every == 0:
-                 logger.info(f"[PROGRESS_DETAIL] Phase 2 (Fine): Step {lbfgs_step_count} | Loss: {l.item():.2f}")
+            opt_lbfgs = torch.optim.LBFGS(
+                all_params,
+                max_iter=lbfgs_max_iter,
+                tolerance_grad=lbfgs_tol_grad,
+                tolerance_change=lbfgs_tol_change,
+                history_size=lbfgs_hist,
+                line_search_fn="strong_wolfe",
+            )
             
-            if lbfgs_step_count % 40 == 0: 
-                save_snapshot(f"lbfgs_{s+1}_{lbfgs_step_count}")
-            return l
+            lbfgs_step_count = 0
+            amp_lbfgs = os.environ.get("MINIFOLD_IGPU_AMP_LBFGS", "0") == "1"
+            def closure():
+                nonlocal lbfgs_step_count
+                opt_lbfgs.zero_grad(set_to_none=True)
+                if amp_lbfgs and use_ipex:
+                    with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16 if torch.xpu.has_bf16_support() else torch.float16):
+                        l = calc_loss()
+                elif amp_lbfgs and device.type == "cuda":
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        l = calc_loss()
+                else:
+                    l = calc_loss()
+                l.backward()
+                lbfgs_step_count += 1
+                if log_every > 0 and lbfgs_step_count % log_every == 0:
+                    msg2 = f"[PROGRESS_DETAIL] Phase 2 (Fine): Step {lbfgs_step_count} | Loss: {l.item():.2f}"
+                    if last_loss_breakdown is not None:
+                        try:
+                            br2 = last_loss_breakdown
+                            msg2 += (
+                                f" | per_res={br2.get('per_res', l / max(1, total_residues)).item():.2f}"
+                                f", ss={br2.get('ss', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", rama={br2.get('rama', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", beta={br2.get('beta', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", hydro={br2.get('hydro', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", mj={br2.get('mj', torch.tensor(0.0, device=device)).item():.1f}"
+                                f", elec={br2.get('elec', torch.tensor(0.0, device=device)).item():.1f}"
+                            )
+                        except Exception:
+                            pass
+                    logger.info(msg2)
+                
+                if lbfgs_step_count % 40 == 0: 
+                    save_snapshot(f"lbfgs_{s+1}_{lbfgs_step_count}")
+                return l
             
-        try:
-            opt_lbfgs.step(closure)
-        except Exception as e:
-            logger.warning(f"Optimization step failed: {e}")
-        with torch.no_grad():
-            cur_loss = calc_loss().item()
-            if (best_loss is None) or (cur_loss < best_loss):
-                best_loss = cur_loss
-                best_phi = [p.detach().clone() for p in phi_params]
-                best_psi = [q.detach().clone() for q in psi_params]
-                best_omega = [o.detach().clone() for o in omega_params]
-                best_rb = rb_params.detach().clone() if rb_params is not None else None
+            try:
+                opt_lbfgs.step(closure)
+            except Exception as e:
+                logger.warning(f"Optimization step failed: {e}")
+            with torch.no_grad():
+                cur_loss = calc_loss().item()
+                if (best_loss is None) or (cur_loss < best_loss):
+                    best_loss = cur_loss
+                    best_phi = [p.detach().clone() for p in phi_params]
+                    best_psi = [q.detach().clone() for q in psi_params]
+                    best_omega = [o.detach().clone() for o in omega_params]
+                    best_rb = rb_params.detach().clone() if rb_params is not None else None
     with torch.no_grad():
         if best_phi is not None and best_psi is not None and best_omega is not None:
             for i in range(len(phi_params)):
