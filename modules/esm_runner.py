@@ -148,7 +148,11 @@ def load_esmfold_model(model_path=None, backend="auto"):
     ckpt_path = model_path
     if ckpt_path is None:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ckpt_path = os.path.join(root, "3d_moudel", "best_model_gpu.pt")
+        ckpt_path = os.path.join(root, "3d_model", "best_model_gpu.pt")
+        if not os.path.exists(ckpt_path):
+            ckpt_path_legacy = os.path.join(root, "3d_moudel", "best_model_gpu.pt")
+            if os.path.exists(ckpt_path_legacy):
+                ckpt_path = ckpt_path_legacy
     if ckpt_path and os.path.exists(ckpt_path):
         state = torch.load(ckpt_path, map_location=device)
         if isinstance(state, dict):

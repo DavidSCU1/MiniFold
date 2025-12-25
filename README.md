@@ -41,7 +41,7 @@ MiniFold 是一个将 LLM 生成的二级结构“直觉”和基于 PyTorch 的
 - `scripts/`
   - `post_assemble.py`：对已经生成的链结构做后装配和可视化。
   - `dml_probe.py`：用于 DirectML / 设备探测的小工具。
-- `3d_moudel/best_model_gpu.pt`：ESMFold 相关 3D 主干模型权重。
+- `3d_model/best_model_gpu.pt`：ESMFold 相关 3D 主干模型权重（已随仓库提供）。
 - `MiniFold_Web.bat`：Windows 下启动 Web 界面的批处理脚本。
 
 ## 环境与依赖
@@ -148,7 +148,7 @@ python minifold.py input.fasta \
 - `--refine-hydrophobic`：分析疏水核心并尝试压实。
 - `--repack-long-sides`：对长侧链（Lys/Gln/Glu 等）进行重新 packing。
 - `--md` / `--md-steps`：选择后处理引擎（`openmm|amber|gromacs`）及步数，需用户自行准备环境。
-- `--esm-backbone` / `--esm-env`：使用 `3d_moudel/best_model_gpu.pt` 提供的 ESM 主干模型，可在独立环境中运行。
+- `--esm-backbone` / `--esm-env`：使用 `3d_model/best_model_gpu.pt` 提供的 ESM 主干模型，可在独立环境中运行。
 
 运行结束后，默认在 `output/<输入文件前缀>/` 下生成：
 - 中间 JSON 与文本：SS 候选、Ark 投票结果、refine 记录等。
