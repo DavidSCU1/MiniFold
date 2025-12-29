@@ -586,26 +586,17 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         ss_probs = _compute_ss_probs(sub_seq).to(device)
         w_tensor = (ss_probs[:,0] + ss_probs[:,1]).clamp(0.0, 1.0)
         
-        # Prepare Residue Properties
         hydro_indices = []
         charge_vals = []
         
-        # Refined Hydrophobic Mapping (Kyte-Doolittle Scale)
-        # Normalized (0.0 to 1.0), only positive hydrophobicity considered for core.
-        # AlphaFold uses "Residue Interaction Networks" implicitly via Evoformer.
-        # We explicitly model the physical property.
-        # I: 1.0, V: 0.9, L: 0.8, F: 0.6, M: 0.4, A: 0.4
         HP_MAP = {
             'I': 1.0, 'V': 0.9, 'L': 0.8, 'F': 0.6, 'M': 0.4, 'A': 0.4
         }
-        # C, Y, W treated as weak or polar for this purpose.
         
-        # Charge: D=-1, E=-1, K=1, R=1, H=0.5 (at pH 7)
         CHARGE_MAP = {'D': -1.0, 'E': -1.0, 'K': 1.0, 'R': 1.0, 'H': 0.5}
         POLAR_SET = set(['D','E','K','R','H','N','Q','S','T','Y','C','W'])
         AROMATIC_SET = set(['F','Y','W'])
         
-        # User-defined sets for primitive collapse
         COLLAPSE_HYDRO_SET = set(['I', 'L', 'V', 'F', 'M'])
         CHARGED_CLASH_SET = set(['D', 'E', 'K', 'R'])
 
@@ -639,6 +630,38 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             device=device,
             dtype=torch.long,
         )
+        pos_types = []
+        if len(ss) > 0:
+            start = 0
+            while start < len(ss):
+                c = ss[start]
+                end = start + 1
+                while end < len(ss) and ss[end] == c:
+                    end += 1
+                length = end - start
+                for k in range(length):
+                    if c == "H":
+                        if length <= 2:
+                            pos_types.append(1)
+                        else:
+                            if k == 0 or k == length - 1:
+                                pos_types.append(2)
+                            else:
+                                pos_types.append(1)
+                    elif c == "E":
+                        if length <= 2:
+                            pos_types.append(3)
+                        else:
+                            if k == 0 or k == length - 1:
+                                pos_types.append(4)
+                            else:
+                                pos_types.append(3)
+                    else:
+                        pos_types.append(0)
+                start = end
+        if len(pos_types) < len(sub_seq):
+            pos_types.extend([0] * (len(sub_seq) - len(pos_types)))
+        pos_type_tensor = torch.tensor(pos_types, device=device, dtype=torch.long)
 
         chain_data.append({
             "seq": sub_seq,
@@ -655,6 +678,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             "charged_clash_mask": charged_clash_mask,
             "rama_group_ids": rama_group_ids,
             "prepro_mask": torch.tensor([1.0 if (j + 1 < len(sub_seq) and sub_seq[j + 1] == "P") else 0.0 for j in range(len(sub_seq))], device=device, dtype=torch.float32),
+            "pos_type": pos_type_tensor,
         })
         
         start_idx += L_seq
@@ -726,6 +750,26 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         rama_centers_pad[gi, :k, :] = centers
         rama_valid_pad[gi, :k] = 1.0
         rama_sigma[gi, :] = torch.tensor(RAMA_SIGMA[g], device=device, dtype=torch.float32)
+    
+    def _apply_rama_codebook(phi_raw, psi_raw, seq, device_inner):
+        phi_eff = phi_raw.clone()
+        psi_eff = psi_raw.clone()
+        if not seq:
+            return phi_eff, psi_eff
+        mask_vit = torch.tensor([aa in ("V", "I", "T") for aa in seq], device=device_inner, dtype=torch.bool)
+        if mask_vit.any():
+            beta_phi = math.radians(-119.0)
+            beta_psi = math.radians(120.0)
+            beta_phi_t = torch.tensor(beta_phi, device=device_inner)
+            beta_psi_t = torch.tensor(beta_psi, device=device_inner)
+            phi_eff[mask_vit] = beta_phi_t + 0.5 * torch.tanh(phi_raw[mask_vit] - beta_phi_t)
+            psi_eff[mask_vit] = beta_psi_t + 0.5 * torch.tanh(psi_raw[mask_vit] - beta_psi_t)
+        mask_pro = torch.tensor([aa == "P" for aa in seq], device=device_inner, dtype=torch.bool)
+        if mask_pro.any():
+            pro_phi0 = math.radians(-65.0)
+            pro_phi_t = torch.tensor(pro_phi0, device=device_inner)
+            phi_eff[mask_pro] = pro_phi_t + 0.3 * torch.tanh(phi_raw[mask_pro] - pro_phi_t)
+        return phi_eff, psi_eff
         
     # Precompute MJ tensor
     mj_tensor = torch.tensor(MJ_VALUES, dtype=torch.float32, device=device)
@@ -752,11 +796,22 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
     
     full_collapse_hydro = torch.cat([d["collapse_hydro_mask"] for d in chain_data], dim=0)
     full_charged_clash = torch.cat([d["charged_clash_mask"] for d in chain_data], dim=0)
+    full_pos_type = torch.cat([d.get("pos_type", torch.zeros(len(d["seq"]), device=device, dtype=torch.long)) for d in chain_data], dim=0)
+    ss_labels = []
+    for d in chain_data:
+        s = d.get("ss", "")
+        if isinstance(s, str):
+            ss_labels.extend(list(s))
+        else:
+            ss_labels.extend(["C"] * len(d["seq"]))
+    full_ss_H = torch.tensor([1.0 if c == "H" else 0.0 for c in ss_labels], device=device)
+    full_ss_E = torch.tensor([1.0 if c == "E" else 0.0 for c in ss_labels], device=device)
 
     idx = torch.arange(total_residues, device=device)
     idx_diff = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
     mask_nonlocal = (torch.triu(torch.ones((total_residues, total_residues), device=device), diagonal=3) > 0).float()
     cross_mask = (chain_ids.unsqueeze(0) != chain_ids.unsqueeze(1)).float()
+    same_chain = 1.0 - cross_mask
 
     n_full_atoms = total_residues * 4
     n_heavy_atoms = total_residues * 5
@@ -776,10 +831,12 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         loss_omega = torch.tensor(0.0, device=device)
         loss_frag = torch.tensor(0.0, device=device)
         loss_beta = torch.tensor(0.0, device=device)
+        loss_loop = torch.tensor(0.0, device=device)
         
         for i, d in enumerate(chain_data):
-            phi = phi_params[i]
-            psi = psi_params[i]
+            phi_raw = phi_params[i]
+            psi_raw = psi_params[i]
+            phi, psi = _apply_rama_codebook(phi_raw, psi_raw, d["seq"], device)
             omega = omega_params[i]
             
             ss_probs = d.get("ss_probs")
@@ -799,6 +856,16 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 res_weight = res_weight - 0.2 * d["polar_mask"].clamp(0.0, 1.0)
                 res_weight = torch.where(d["rama_group_ids"] == 1, res_weight * 0.7, res_weight)
                 res_weight = torch.where(d["rama_group_ids"] == 2, res_weight * 0.7, res_weight)
+                pos_type_local = d.get("pos_type")
+                if pos_type_local is not None:
+                    core_mask_local = ((pos_type_local == 1) | (pos_type_local == 3))
+                    cap_edge_mask_local = ((pos_type_local == 2) | (pos_type_local == 4))
+                    loop_mask_local = (pos_type_local == 0)
+                    scale_local = torch.ones_like(res_weight)
+                    scale_local = torch.where(core_mask_local, scale_local * 2.0, scale_local)
+                    scale_local = torch.where(cap_edge_mask_local, scale_local * 0.8, scale_local)
+                    scale_local = torch.where(loop_mask_local, scale_local * 0.4, scale_local)
+                    res_weight = res_weight * scale_local
                 soft_w = res_weight * (pH + pE) * (1.0 - 0.5 * pC)
                 loss_ss = loss_ss + torch.sum(soft_w * (pH * d_h + pE * d_e))
             else:
@@ -810,12 +877,12 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             if group_ids is None:
                 group_ids = torch.zeros((len(d["seq"]),), device=device, dtype=torch.long)
 
-            c_t = rama_centers_pad.index_select(0, group_ids)  # (L, K, 2)
-            v_t = rama_valid_pad.index_select(0, group_ids)    # (L, K)
-            s_t = rama_sigma.index_select(0, group_ids)        # (L, 2)
+            c_t = rama_centers_pad.index_select(0, group_ids)
+            v_t = rama_valid_pad.index_select(0, group_ids)
+            s_t = rama_sigma.index_select(0, group_ids)
 
-            phi_ex = phi.unsqueeze(1)  # (L, 1)
-            psi_ex = psi.unsqueeze(1)  # (L, 1)
+            phi_ex = phi.unsqueeze(1)
+            psi_ex = psi.unsqueeze(1)
 
             dphi = torch.remainder(phi_ex - c_t[:, :, 0] + math.pi, 2 * math.pi) - math.pi
             dpsi = torch.remainder(psi_ex - c_t[:, :, 1] + math.pi, 2 * math.pi) - math.pi
@@ -824,17 +891,23 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             term = term + (1.0 - v_t) * 1e6
 
             min_term = torch.min(term, dim=1)[0]
+            pos_type_local = d.get("pos_type")
+            if pos_type_local is not None:
+                scale_rama = torch.ones_like(min_term)
+                core_mask_local = ((pos_type_local == 1) | (pos_type_local == 3))
+                cap_edge_mask_local = ((pos_type_local == 2) | (pos_type_local == 4))
+                loop_mask_local = (pos_type_local == 0)
+                scale_rama = torch.where(core_mask_local, scale_rama * 2.0, scale_rama)
+                scale_rama = torch.where(cap_edge_mask_local, scale_rama * 0.8, scale_rama)
+                scale_rama = torch.where(loop_mask_local, scale_rama * 0.4, scale_rama)
+                min_term = min_term * scale_rama
             
-            # User Feedback: Relax Rama "Perfectionism"
-            # Allow 3% outliers (ignore the worst 3% of residues from the loss)
             n_res = min_term.size(0)
             n_keep = max(1, int(n_res * 0.97))
             
             sorted_term, _ = torch.sort(min_term)
             valid_term = sorted_term[:n_keep]
             
-            # Soft Potential: Flat bottom (no force if within 1.0 sigma^2)
-            # Remove the hard penalty for outliers (relu(min_term - 4.0)**2 * 25.0)
             rama_soft = torch.sum(torch.relu(valid_term - 1.0))
             loss_rama = loss_rama + rama_soft
 
@@ -899,15 +972,15 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 beta_indices = [j for j, c in enumerate(ss_str) if c == "E"]
                 if len(beta_indices) >= 2:
                     idx_tensor = torch.tensor(beta_indices, device=device, dtype=torch.long)
-                    coords = CA[idx_tensor]
-                    diff = coords.unsqueeze(1) - coords.unsqueeze(0)
-                    dist = torch.norm(diff, dim=2) + 1e-6
+                    coords_ca = CA[idx_tensor]
+                    diff_ca = coords_ca.unsqueeze(1) - coords_ca.unsqueeze(0)
+                    dist_ca = torch.norm(diff_ca, dim=2) + 1e-6
                     sep = torch.abs(idx_tensor.unsqueeze(1) - idx_tensor.unsqueeze(0))
                     mask = sep > 3
                     if mask.any():
-                        dist_sel = dist[mask]
-                        d0 = 5.5
-                        width = 1.5
+                        dist_sel = dist_ca[mask]
+                        d0 = 5.0
+                        width = 0.5
                         e_dist = torch.mean(((dist_sel - d0) / width) ** 2)
                     else:
                         e_dist = torch.tensor(0.0, device=device)
@@ -930,7 +1003,46 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                             e_orient = torch.tensor(0.0, device=device)
                     else:
                         e_orient = torch.tensor(0.0, device=device)
-                    loss_beta = loss_beta + (e_dist + 0.3 * e_orient)
+                    O_beta = O[idx_tensor]
+                    N_beta = N[idx_tensor]
+                    diff_on = O_beta.unsqueeze(1) - N_beta.unsqueeze(0)
+                    dist_on = torch.norm(diff_on, dim=2) + 1e-6
+                    if mask.any():
+                        dist_on_sel = dist_on[mask]
+                        on_term = torch.mean(torch.abs(dist_on_sel - 2.8))
+                    else:
+                        on_term = torch.tensor(0.0, device=device)
+                    phi_beta = phi[idx_tensor]
+                    psi_beta = psi[idx_tensor]
+                    beta_phi0 = math.radians(-119.0)
+                    beta_psi0 = math.radians(120.0)
+                    beta_phi_t = torch.tensor(beta_phi0, device=device)
+                    beta_psi_t = torch.tensor(beta_psi0, device=device)
+                    dphi_beta = torch.remainder(phi_beta - beta_phi_t + math.pi, 2 * math.pi) - math.pi
+                    dpsi_beta = torch.remainder(psi_beta - beta_psi_t + math.pi, 2 * math.pi) - math.pi
+                    angle_term = torch.mean(dphi_beta**2 + dpsi_beta**2)
+                    loss_beta = loss_beta + (e_dist + 0.3 * e_orient + on_term + 0.5 * angle_term)
+            if isinstance(ss_str, str) and L_ss > 0 and CA.shape[0] >= L_ss:
+                idx_loop = 0
+                while idx_loop < L_ss:
+                    if ss_str[idx_loop] != "C":
+                        idx_loop += 1
+                        continue
+                    start_loop = idx_loop
+                    while idx_loop < L_ss and ss_str[idx_loop] == "C":
+                        idx_loop += 1
+                    end_loop = idx_loop - 1
+                    prev_i = start_loop - 1
+                    next_i = end_loop + 1
+                    loop_len = end_loop - start_loop + 1
+                    if prev_i >= 0 and next_i < L_ss:
+                        ca_prev = CA[prev_i]
+                        ca_next = CA[next_i]
+                        dist_end = torch.norm(ca_next - ca_prev) + 1e-6
+                        path_len = (loop_len + 1) * 3.8
+                        d_max = path_len * 0.7
+                        loop_term = torch.relu(dist_end - d_max) ** 2
+                        loss_loop = loss_loop + loop_term
             
         full_CA = torch.cat(all_CA)
         full_CB = torch.cat(all_CB)
@@ -978,7 +1090,7 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         
         dist_ca_pairs = torch.cdist(full_CA, full_CA, p=2.0)
         pair_mask_ca = torch.triu(torch.ones_like(dist_ca_pairs, dtype=torch.bool), diagonal=1) & (idx_diff >= 2)
-        ca_pen = torch.relu(3.6 - dist_ca_pairs) ** 2
+        ca_pen = torch.relu(3.8 - dist_ca_pairs) ** 2
         loss_ca_hard36 = torch.sum(ca_pen[pair_mask_ca])
         
         eps_values = torch.tensor([0.12, 0.10, 0.15, 0.20, 0.18], device=device, dtype=heavy_atoms.dtype)
@@ -1021,12 +1133,46 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         iface_pairs = torch.sum(hp_mat * mask_nonlocal * cross_mask) + 1.0
         loss_iface_hydro = iface_sum / iface_pairs
         
-        mj_selected = mj_tensor.index_select(0, aa_indices).index_select(1, aa_indices)
-        contact_w = torch.exp(-((dist_cb - 6.0)**2) / (2.0 * (2.0**2)))
-        mj_mask = ((dist_cb < 10.0) & (dist_cb > 3.0)).float()
-        mj_pairs = torch.sum(mj_selected * contact_w * mask_nonlocal * cross_mask * mj_mask * ori_gate)
-        mj_count = torch.sum(mask_nonlocal * cross_mask * mj_mask) + 1.0
-        loss_mj = - mj_pairs / mj_count
+        r_min_cb = 2.6
+        r_opt_cb = 3.6
+        r_cut_cb = 5.0
+        A_cb = 8.0
+        B_cb = 1.0
+        sigma_cb = 0.4
+        base_E_cb = torch.zeros_like(dist_cb)
+        mask_rep_cb = dist_cb < r_min_cb
+        base_E_cb[mask_rep_cb] = A_cb * (r_min_cb - dist_cb[mask_rep_cb]) ** 2
+        mask_well_cb = (dist_cb >= r_min_cb) & (dist_cb <= r_opt_cb)
+        base_E_cb[mask_well_cb] = -B_cb * torch.exp(-((dist_cb[mask_well_cb] - r_opt_cb) ** 2) / (sigma_cb ** 2))
+        type_idx = torch.zeros_like(aa_indices)
+        hph_set = set(['A','V','I','L','M','F','W','Y'])
+        pos_set = set(['K','R','H'])
+        neg_set = set(['D','E'])
+        seq_all = used_sequence
+        type_list = []
+        for a in seq_all:
+            if a in hph_set:
+                type_list.append(0)
+            elif a in pos_set:
+                type_list.append(2)
+            elif a in neg_set:
+                type_list.append(3)
+            else:
+                type_list.append(1)
+        type_tensor = torch.tensor(type_list, device=device, dtype=torch.long)
+        ti = type_tensor.unsqueeze(1)
+        tj = type_tensor.unsqueeze(0)
+        W_tb = torch.tensor([[1.0,0.4,0.2,0.2],
+                             [0.4,0.6,0.8,0.8],
+                             [0.2,0.8,0.3,1.2],
+                             [0.2,0.8,1.2,0.3]], device=device, dtype=dist_cb.dtype)
+        wtype_cb = W_tb[ti, tj]
+        E_cb = base_E_cb * wtype_cb
+        mask_cut_cb = (dist_cb <= r_cut_cb) & (dist_cb > 0.0)
+        if mask_cut_cb.any():
+            loss_mj = torch.sum(E_cb * mask_nonlocal * mask_cut_cb * ((1.0 - cross_mask) + cross_mask * ori_gate)) / (torch.sum(mask_nonlocal * mask_cut_cb) + 1.0)
+        else:
+            loss_mj = torch.tensor(0.0, device=device)
         
         q_mat = full_charge.unsqueeze(0) * full_charge.unsqueeze(1)
         eps = 10.0 + 70.0 * torch.clamp(dist_cb / 12.0, min=0.0, max=1.0)
@@ -1073,18 +1219,47 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         exposure = 1.0 / (1.0 + neighbor_counts)
         loss_burial = torch.sum(full_hydro * exposure)
         loss_polar = torch.sum(full_polar * (1.0 - exposure))
+        abs_charge = torch.abs(full_charge)
+        core_mask_global = ((full_pos_type == 1) | (full_pos_type == 3)).float()
+        charge_weight = 1.0 + core_mask_global
+        loss_charge_burial = torch.sum(abs_charge * (1.0 - exposure) * charge_weight)
+        
+        hydro_mask_cent = full_hydro > 0.0
+        if hydro_mask_cent.any():
+            cb_h = full_CB[hydro_mask_cent]
+            center_h = torch.mean(cb_h, dim=0)
+            dist_h = torch.norm(cb_h - center_h, dim=1)
+            loss_hydro_centroid = torch.mean(dist_h)
+        else:
+            loss_hydro_centroid = torch.tensor(0.0, device=device)
         
         full_H = torch.cat(all_H)
         diff_ho = full_H.unsqueeze(1) - full_O.unsqueeze(0)
         dist_ho = torch.norm(diff_ho, dim=2) + 1e-6
-        hb_mask = ((idx_diff > 3) & (dist_ho < HB_MAX_DIST)).float()
+        diff_no = full_N.unsqueeze(1) - full_O.unsqueeze(0)
+        dist_no = torch.norm(diff_no, dim=2) + 1e-6
+        hb_mask_dist = (dist_no > 2.7) & (dist_no < 3.2)
+        helix_pair = (full_ss_H.unsqueeze(1) > 0.5) & (full_ss_H.unsqueeze(0) > 0.5)
+        beta_pair = (full_ss_E.unsqueeze(1) > 0.5) & (full_ss_E.unsqueeze(0) > 0.5)
+        hb_mask_helix = (idx_diff == 4) & (same_chain > 0.5) & helix_pair
+        hb_mask_beta = (idx_diff > 3) & beta_pair
+        hb_pair_mask = hb_mask_helix | hb_mask_beta
         hn_vec = full_H - torch.cat(all_N)
         hn_unit = hn_vec / (torch.norm(hn_vec, dim=1, keepdim=True) + 1e-6)
         ho_unit = diff_ho / (dist_ho.unsqueeze(2))
-        cos_ang = torch.sum(hn_unit.unsqueeze(1) * ho_unit, dim=2).clamp(-1.0, 1.0)
-        ang = torch.acos(cos_ang)
-        dist_w = torch.exp(-((dist_ho - HB_OPT_DIST)**2) / (0.25**2))
-        ang_w = torch.exp(-((ang - HB_OPT_ANGLE)**2) / (math.radians(20)**2))
+        cos_nho = torch.sum(hn_unit.unsqueeze(1) * ho_unit, dim=2).clamp(-1.0, 1.0)
+        ang_nho = torch.acos(cos_nho)
+        co_vec = full_C - full_O
+        co_unit = co_vec / (torch.norm(co_vec, dim=1, keepdim=True) + 1e-6)
+        co_unit_exp = co_unit.unsqueeze(1)
+        cos_coh = torch.sum(co_unit_exp * ho_unit, dim=2).clamp(-1.0, 1.0)
+        ang_coh = torch.acos(cos_coh)
+        ang_mask_nho = ang_nho > HB_MIN_ANGLE
+        ang_mask_coh = ang_coh > math.radians(90.0)
+        geom_mask = hb_mask_dist & ang_mask_nho & ang_mask_coh
+        hb_mask = (hb_pair_mask & geom_mask).float()
+        dist_w = torch.exp(-((dist_no - HB_OPT_DIST)**2) / (0.25**2))
+        ang_w = torch.exp(-((ang_nho - HB_OPT_ANGLE)**2) / (math.radians(20)**2))
         hb_score = dist_w * ang_w * hb_mask
         hb_energy = -torch.sum(hb_score) * 0.5
         
@@ -1114,13 +1289,12 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         # CA-CA < 8 A: negative score
         # CA-CA < 6 A: additional negative score
         hp_col_mat = full_collapse_hydro.unsqueeze(0) * full_collapse_hydro.unsqueeze(1)
-        # pair_mask_ca is upper triangle and idx_diff >= 2
-        
         d8_mask = (dist_ca_pairs < 8.0).float()
         d6_mask = (dist_ca_pairs < 6.0).float()
-        
-        # Reward is negative energy
-        loss_hydro_collapse = -torch.sum((d8_mask + d6_mask) * hp_col_mat * pair_mask_ca.float())
+        core_mask_pair_i = ((full_pos_type == 1) | (full_pos_type == 3)).float().unsqueeze(0)
+        core_mask_pair_j = ((full_pos_type == 1) | (full_pos_type == 3)).float().unsqueeze(1)
+        core_pair_weight = 1.0 + 0.5 * (core_mask_pair_i + core_mask_pair_j)
+        loss_hydro_collapse = -torch.sum((d8_mask + d6_mask) * hp_col_mat * pair_mask_ca.float() * core_pair_weight)
         
         # 2. Charged Clash (D, E, K, R)
         # < 4 A clash penalty
@@ -1128,6 +1302,14 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         d4_mask = (dist_ca_pairs < 4.0).float()
         
         loss_charged_clash = torch.sum(d4_mask * chg_clash_mat * pair_mask_ca.float())
+        
+        rep_mask = dist_ca_pairs < 3.8
+        rep_term = torch.relu(3.8 - dist_ca_pairs) ** 2
+        rep_energy = torch.sum(rep_term * rep_mask.float() * pair_mask_ca.float())
+        attr_mask = (dist_ca_pairs >= 4.5) & (dist_ca_pairs <= 6.5)
+        attr_term = torch.exp(-((dist_ca_pairs - 5.5) ** 2) / (2.0 * (0.8 ** 2)))
+        attr_energy = torch.sum(attr_term * attr_mask.float() * pair_mask_ca.float())
+        loss_ca_lj = rep_energy - 0.2 * attr_energy
 
         # Weights (Tuned for Bio-plausibility)
         w_rg = 1.5
@@ -1153,12 +1335,17 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         w_mj = 4.0 # Boosted: Statistical potential reflects natural selection
         w_disulfide = 5.0 # Strong bias for SS bonds
         w_ca_hard36 = 10.0
+        w_ca_lj = 1.0
         w_elec_bb = 0.8
         
         w_hydro_collapse = 3.0
+        w_hydro_centroid = 0.5
         w_charged_clash = 50.0
         w_frag = 1.0
         w_beta = 3.0
+        w_loop = 1.0
+        w_contact_density = 0.3
+        w_charge_burial = 5.0
         if opt_phase == "warmup":
             w_ss = 0.5
             w_rama = 1.5
@@ -1171,14 +1358,18 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             w_polar = 0.5
             w_frag = 0.5
         
+        mean_nc = torch.mean(neighbor_counts)
+        loss_contact_density = (mean_nc - 8.0) ** 2
+        
         loss = (loss_ss * w_ss + loss_rama * w_rama + loss_omega * w_omega + loss_smooth * w_smooth + loss_rg_target * w_rg_tgt + 
                 clash_loss * w_clash + loss_hard_clash * w_hard_clash + heavy_loss * w_heavy + loss_ca_continuity * w_ca_cont +
                 loss_hydro * w_hydro + loss_iface_hydro * w_iface_hydro + loss_mj * w_mj + 
                 loss_elec * w_elec + loss_elec_bb * w_elec_bb + loss_catpi * w_catpi + loss_pipi * w_pipi + 
                 loss_lj * w_lj + loss_vdw * w_vdw_heavy + loss_burial * w_burial + loss_polar * w_polar +
-                hb_energy * w_hb + loss_disulfide * w_disulfide + loss_ca_hard36 * w_ca_hard36 + loss_frag * w_frag +
+                hb_energy * w_hb + loss_disulfide * w_disulfide + loss_ca_hard36 * w_ca_hard36 + loss_ca_lj * w_ca_lj + loss_hydro_centroid * w_hydro_centroid + loss_frag * w_frag +
                 loss_beta * w_beta +
-                loss_hydro_collapse * w_hydro_collapse + loss_charged_clash * w_charged_clash)
+                loss_hydro_collapse * w_hydro_collapse + loss_charged_clash * w_charged_clash +
+                loss_loop * w_loop + loss_contact_density * w_contact_density + loss_charge_burial * w_charge_burial)
         
         loss_constraints = torch.tensor(0.0, device=device)
         if constraints:
@@ -1241,10 +1432,12 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                 "rama": (loss_rama * w_rama).detach(),
                 "beta": (loss_beta * w_beta).detach(),
                 "hydro": (loss_hydro * w_hydro).detach(),
+                "hydro_centroid": (loss_hydro_centroid * w_hydro_centroid).detach(),
                 "mj": (loss_mj * w_mj).detach(),
                 "elec": (loss_elec * w_elec).detach(),
                 "rg": (loss_rg_target * w_rg_tgt).detach(),
                 "hb": (hb_energy * w_hb).detach(),
+                "ca_lj": (loss_ca_lj * w_ca_lj).detach(),
                 "constraints": loss_constraints.detach(),
             }
         except Exception:

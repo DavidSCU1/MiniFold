@@ -10,6 +10,7 @@ from modules.ark_module import ark_vote_cases, get_default_models, ark_refine_st
 from modules.backbone_predictor import run_backbone_fold_multichain
 from modules.visualization import generate_html_view
 from modules.esm_runner import predict_structure_with_esm
+from modules.refine import run_refinements
 
 def run_pipeline(
     fasta,
@@ -548,6 +549,20 @@ def run_pipeline(
                                         log_callback(f"[NPU Inline Error] {e}")
                             except Exception as e:
                                 log_callback(f"[NPU Runner Error] {e}")
+
+                        try:
+                            updated = run_refinements(
+                                pdb_path,
+                                sequence,
+                                do_ramachandran=True,
+                                md_engine="openmm",
+                                md_steps=2000,
+                            )
+                            if updated:
+                                log_callback("  > Refinement: Applied Ramachandran/OpenMM post-processing.")
+                        except Exception as e:
+                            log_callback(f"  > Refinement skipped: {e}")
+
                         html_name = f"{prefix}_{suffix}.html"
                         html_path = os.path.join(three_d_dir, html_name)
                         generate_html_view(pdb_path, html_path)
@@ -734,6 +749,20 @@ def run_pipeline(
                                     log_callback(f"[NPU Inline Error] {e}")
                         except Exception as e:
                             log_callback(f"[NPU Runner Error] {e}")
+
+                    try:
+                        updated = run_refinements(
+                            pdb_path,
+                            sequence,
+                            do_ramachandran=True,
+                            md_engine="openmm",
+                            md_steps=2000,
+                        )
+                        if updated:
+                            log_callback("  > Refinement: Applied Ramachandran/OpenMM post-processing.")
+                    except Exception as e:
+                        log_callback(f"  > Refinement skipped: {e}")
+
                     html_name = f"{prefix}_{suffix}.html"
                     html_path = os.path.join(three_d_dir, html_name)
                     generate_html_view(pdb_path, html_path)

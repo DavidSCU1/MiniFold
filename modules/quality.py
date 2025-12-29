@@ -44,19 +44,48 @@ def contact_energy(CA, CB, seq, mj_matrix):
     n = len(CA)
     if n == 0:
         return 0.0
-    aa_order = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','S','T','W','Y','V']
-    idx = {aa:i for i,aa in enumerate(aa_order)}
-    ids = np.array([idx.get(a, 0) for a in seq], dtype=int)
+    seq = str(seq or "")
     diff = CB[np.newaxis, :, :] - CB[:, np.newaxis, :]
     dist = np.linalg.norm(diff, axis=2) + 1e-6
-    w = np.exp(-((dist - 6.0) ** 2) / (2.0 * (2.0 ** 2)))
-    mask = (dist < 10.0) & (dist > 3.0)
-    M = mj_matrix[np.ix_(ids, ids)]
-    score = np.sum(M * w * mask)
-    pairs = np.sum(mask)
-    if pairs < 1:
+    r_min = 2.6
+    r_opt = 3.6
+    r_cut = 5.0
+    A = 8.0
+    B = 1.0
+    sigma = 0.4
+    base_E = np.zeros_like(dist)
+    mask_rep = dist < r_min
+    base_E[mask_rep] = A * (r_min - dist[mask_rep]) ** 2
+    mask_well = (dist >= r_min) & (dist <= r_opt)
+    base_E[mask_well] = -B * np.exp(-((dist[mask_well] - r_opt) ** 2) / (sigma ** 2))
+    atom_type = np.zeros((n,), dtype=int)
+    seq_upper = [c.upper() for c in seq]
+    for i in range(min(n, len(seq_upper))):
+        aa = seq_upper[i]
+        if aa in ("A", "V", "I", "L", "M", "F", "W", "Y"):
+            atom_type[i] = 0
+        elif aa in ("K", "R", "H"):
+            atom_type[i] = 2
+        elif aa in ("D", "E"):
+            atom_type[i] = 3
+        else:
+            atom_type[i] = 1
+    W = np.array([
+        [1.0, 0.4, 0.2, 0.2],
+        [0.4, 0.6, 0.8, 0.8],
+        [0.2, 0.8, 0.3, 1.2],
+        [0.2, 0.8, 1.2, 0.3],
+    ], dtype=float)
+    ti = atom_type[:, np.newaxis]
+    tj = atom_type[np.newaxis, :]
+    wtype = W[ti, tj]
+    E = base_E * wtype
+    mask_cut = dist <= r_cut
+    if not np.any(mask_cut):
         return 0.0
-    return float(score) / float(pairs)
+    score = np.sum(E[mask_cut])
+    pairs = float(np.sum(mask_cut))
+    return float(score / pairs)
 
 def tm_score_proxy(CA):
     CA = np.asarray(CA, dtype=float)

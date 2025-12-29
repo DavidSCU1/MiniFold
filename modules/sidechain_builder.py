@@ -176,34 +176,17 @@ def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=
         if local_environment_atoms is not None and len(local_environment_atoms) > 0:
             sc_coords = np.array(list(atoms.values()))
             if len(sc_coords) == 0: 
-                if min_clash > 0: # Empty sidechain (GLY) is always best
+                if min_clash > 0:
                      min_clash = 0
                      best_atoms = atoms
                 continue
 
-            # Ensure env is numpy array
             env = local_environment_atoms
             if not isinstance(env, np.ndarray):
                 env = np.array(env)
-            
-            # Simple distance check (N_sc, M_env)
-            # Use broadcasting
-            # shape: (N, 1, 3) - (1, M, 3) -> (N, M, 3)
-            # This can be memory intensive for large env.
-            # Optimization: Compute dists in blocks or just loop if M is huge.
-            # For typical proteins (M < 5000), it's fine.
-            
-            diff = sc_coords[:, np.newaxis, :] - env[np.newaxis, :, :]
-            dists = np.linalg.norm(diff, axis=2) + 1e-6
-            clashes = np.sum((dists < 1.5) & (dists > 0.1))
-            clash_score = float(clashes)
-            heavy_loss = float(np.sum(np.maximum(0.0, 2.6 - dists) ** 2))
-            sigma = 4.0
-            epsilon = 0.05
-            r = np.clip(dists, 0.5, None)
-            lj = epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
-            lj_sum = float(np.sum(lj))
-        score = clash_score * 5.0 + heavy_loss * 1.0 + lj_sum * 0.2
+            score = _score_atoms(aa_code, sc_coords, env)
+        else:
+            score = 0.0
         if score < min_clash:
             min_clash = score
             best_atoms = atoms
@@ -220,7 +203,7 @@ def pack_sidechain(aa_code, n_coord, ca_coord, c_coord, local_environment_atoms=
                 return refined
         return best_atoms
 
-def _score_atoms(sc_coords, env):
+def _score_atoms(aa_code, sc_coords, env):
     diff = sc_coords[:, np.newaxis, :] - env[np.newaxis, :, :]
     dists = np.linalg.norm(diff, axis=2) + 1e-6
     clashes = np.sum((dists < 1.5) & (dists > 0.1))
@@ -230,7 +213,16 @@ def _score_atoms(sc_coords, env):
     r = np.clip(dists, 0.5, None)
     lj = epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
     lj_sum = float(np.sum(lj))
-    return clashes * 5.0 + heavy_loss * 1.0 + lj_sum * 0.2
+    contact_mask = (dists < 4.5) & (dists > 1.5)
+    contact_count = float(np.sum(contact_mask))
+    hydrophobic_set = set(["A", "V", "I", "L", "M", "F", "W", "Y"])
+    polar_charged_set = set(["R", "N", "D", "C", "Q", "E", "G", "H", "K", "S", "T"])
+    exposure_term = 0.0
+    if aa_code in hydrophobic_set:
+        exposure_term = -0.1 * contact_count
+    elif aa_code in polar_charged_set:
+        exposure_term = 0.1 * contact_count
+    return clashes * 5.0 + heavy_loss * 1.0 + lj_sum * 0.2 + exposure_term
 
 def _refine_chi(aa_code, n_coord, ca_coord, c_coord, chi_angles, env):
     if chi_angles is None or len(chi_angles) == 0:
@@ -238,7 +230,7 @@ def _refine_chi(aa_code, n_coord, ca_coord, c_coord, chi_angles, env):
     env_arr = env if isinstance(env, np.ndarray) else np.array(env)
     base_atoms = build_sidechain(aa_code, n_coord, ca_coord, c_coord, chi_angles)
     base_coords = np.array(list(base_atoms.values()))
-    best_score = _score_atoms(base_coords, env_arr)
+    best_score = _score_atoms(aa_code, base_coords, env_arr)
     best_atoms = base_atoms
     chis = np.array(chi_angles, dtype=float)
     for scale in [10.0, 5.0]:
@@ -248,7 +240,7 @@ def _refine_chi(aa_code, n_coord, ca_coord, c_coord, chi_angles, env):
             sc = np.array(list(atoms.values()))
             if len(sc) == 0:
                 continue
-            s = _score_atoms(sc, env_arr)
+            s = _score_atoms(aa_code, sc, env_arr)
             if s < best_score:
                 best_score = s
                 best_atoms = atoms

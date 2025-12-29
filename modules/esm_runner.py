@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import numpy as np
 import torch
 
 
@@ -63,6 +64,97 @@ def load_ss_from_file(ss_path):
     return text
 
 
+def _encode_sequence_to_features(sequence, dim, device):
+    aa_order = "ACDEFGHIKLMNPQRSTVWY"
+    aa_to_idx = {a: i for i, a in enumerate(aa_order)}
+    L = len(sequence)
+    x = torch.zeros((1, L, dim), dtype=torch.float32, device=device)
+    for i, c in enumerate(sequence):
+        idx = aa_to_idx.get(c.upper(), 0)
+        if idx < dim:
+            x[0, i, idx] = 1.0
+    mask = torch.ones((1, L), dtype=torch.bool, device=device)
+    return x, mask
+
+
+def _ca_to_backbone(ca):
+    L = ca.shape[0]
+    N = np.zeros_like(ca)
+    C = np.zeros_like(ca)
+    for i in range(L):
+        if L == 1:
+            direction = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            if i == 0:
+                forward = ca[i + 1] - ca[i]
+                backward = forward
+            elif i == L - 1:
+                backward = ca[i] - ca[i - 1]
+                forward = backward
+            else:
+                backward = ca[i] - ca[i - 1]
+                forward = ca[i + 1] - ca[i]
+            v = forward + backward
+            norm = np.linalg.norm(v)
+            if norm < 1e-6:
+                v = forward
+                norm = np.linalg.norm(v)
+            if norm < 1e-6:
+                v = np.array([1.0, 0.0, 0.0], dtype=float)
+            direction = v / (np.linalg.norm(v) + 1e-8)
+        N[i] = ca[i] - direction * 1.46
+        C[i] = ca[i] + direction * 1.52
+    return N, ca, C
+
+
+def _write_backbone_pdb_simple(sequence, N, CA, C, out_path):
+    three_letter = {
+        "A": "ALA",
+        "R": "ARG",
+        "N": "ASN",
+        "D": "ASP",
+        "C": "CYS",
+        "Q": "GLN",
+        "E": "GLU",
+        "G": "GLY",
+        "H": "HIS",
+        "I": "ILE",
+        "L": "LEU",
+        "K": "LYS",
+        "M": "MET",
+        "F": "PHE",
+        "P": "PRO",
+        "S": "SER",
+        "T": "THR",
+        "W": "TRP",
+        "Y": "TYR",
+        "V": "VAL",
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        atom_idx = 1
+        res_idx = 1
+        chain_id = "A"
+        chain_idx = 0
+        for i, aa in enumerate(sequence):
+            resn = three_letter.get(aa, "UNK")
+            f.write(
+                f"ATOM  {atom_idx:5d}  N   {resn:>3s} {chain_id}{res_idx:4d}    {N[i][0]:8.3f}{N[i][1]:8.3f}{N[i][2]:8.3f}  1.00  0.00           N\n"
+            )
+            atom_idx += 1
+            f.write(
+                f"ATOM  {atom_idx:5d}  CA  {resn:>3s} {chain_id}{res_idx:4d}    {CA[i][0]:8.3f}{CA[i][1]:8.3f}{CA[i][2]:8.3f}  1.00  0.00           C\n"
+            )
+            atom_idx += 1
+            f.write(
+                f"ATOM  {atom_idx:5d}  C   {resn:>3s} {chain_id}{res_idx:4d}    {C[i][0]:8.3f}{C[i][1]:8.3f}{C[i][2]:8.3f}  1.00  0.00           C\n"
+            )
+            atom_idx += 1
+            res_idx += 1
+        f.write("TER\n")
+        f.write("END\n")
+    return True
+
+
 def load_esmfold_model(model_path=None, backend="auto"):
     device, actual_backend = select_device(backend)
     ckpt_path = model_path
@@ -76,14 +168,25 @@ def load_esmfold_model(model_path=None, backend="auto"):
     if not ckpt_path or not os.path.exists(ckpt_path):
         raise RuntimeError("ESM model checkpoint not found.")
     state = torch.load(ckpt_path, map_location="cpu")
-    if hasattr(state, "infer_pdb"):
+    model_type = None
+    if isinstance(state, dict):
+        from model import ProteinRegressor
+
+        reg = ProteinRegressor(input_dim=480)
+        reg.load_state_dict(state, strict=True)
+        reg = reg.to(device)
+        reg.eval()
+        model = reg
+        model_type = "regressor_state_dict"
+    elif hasattr(state, "infer_pdb"):
         model = state
+        if isinstance(model, torch.nn.Module):
+            model = model.to(device)
+            model.eval()
+        model_type = "full_model_infer_pdb"
     else:
-        raise RuntimeError("ESM checkpoint must be a full model object with infer_pdb.")
-    if isinstance(model, torch.nn.Module):
-        model = model.to(device)
-        model.eval()
-    return model, None, device, actual_backend
+        raise RuntimeError("Unsupported ESM checkpoint format.")
+    return model, model_type, device, actual_backend
 
 
 def predict_structure_with_esm(
@@ -95,16 +198,29 @@ def predict_structure_with_esm(
     backend="auto",
 ):
     sequence = load_sequence_from_fasta(fasta_path)
-    model, alphabet, device, actual_backend = load_esmfold_model(
+    model, model_type, device, actual_backend = load_esmfold_model(
         model_path=model_path, backend=backend
     )
-    with torch.no_grad():
-        pdb_str = model.infer_pdb(sequence)
     out_dir = os.path.dirname(os.path.abspath(output_pdb_path))
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
-    with open(output_pdb_path, "w", encoding="utf-8") as f:
-        f.write(pdb_str)
+    if model_type == "full_model_infer_pdb":
+        with torch.no_grad():
+            try:
+                pdb_str = model.infer_pdb(sequence)
+            except TypeError:
+                pdb_str = model.infer_pdb(sequence, None)
+        with open(output_pdb_path, "w", encoding="utf-8") as f:
+            f.write(pdb_str)
+    elif model_type == "regressor_state_dict":
+        x, mask = _encode_sequence_to_features(sequence, getattr(model, "input_dim", 480), device)
+        with torch.no_grad():
+            coords = model(x, mask)
+        ca = coords[0].detach().cpu().numpy()
+        N, CA, C = _ca_to_backbone(ca)
+        _write_backbone_pdb_simple(sequence, N, CA, C, output_pdb_path)
+    else:
+        raise RuntimeError("Unknown ESM model type.")
     return {"backend": actual_backend, "device": str(device)}
 
 

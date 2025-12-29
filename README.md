@@ -56,11 +56,8 @@ MiniFold 是一个将 LLM 生成的二级结构“直觉”和基于 PyTorch 的
 - `requests`
 - `pybiomed`（提供 AAIndex1）  
 - `biopython`（解析 FASTA，`Bio.SeqIO`）
-- `tqdm`（进度条工具，部分脚本可使用）
-- `flask`、`flask-cors`（Web API）
-- `colorama`（终端着色）
+- `tqdm`（进度条工具，部分脚本/扩展可使用）
 - `py-cpuinfo`（CPU / iGPU 能力探测）
-- `esm`（facebookresearch/esm，ESM-2 / ESMFold）
 
 在项目根目录执行：
 
@@ -68,9 +65,9 @@ MiniFold 是一个将 LLM 生成的二级结构“直觉”和基于 PyTorch 的
 pip install -r requirements.txt
 ```
 
-ESM 相关依赖：
-- 若使用 PyPI 包，可安装 `esm` 或 `fair-esm` 中提供的 ESM-2/ESMFold 定义，项目默认以模块名 `esm` 进行导入。
-- 若未安装，代码会尝试从 `torch.hub` 的 `facebookresearch/esm` 缓存中加载模型。
+ESM 相关说明：
+- 默认情况下，MiniFold 使用仓库内置的 `3d_model/best_model_gpu.pt` 与本地 `model.py` 中的模型定义，无需额外安装 `esm` 包。
+- 如需集成官方 `facebookresearch/esm` / `fair-esm` 推理代码，可在独立环境中安装相应包，并通过命令行参数 `--esm-env` 或 Web UI 中的 ESM 环境配置指向该环境。
 
 ### 可选加速依赖
 - `torch-directml`：在 Windows 上为 Intel / AMD / NVIDIA 显卡提供统一 iGPU 加速后端。
