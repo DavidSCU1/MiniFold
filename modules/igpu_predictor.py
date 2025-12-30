@@ -1134,16 +1134,24 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         loss_iface_hydro = iface_sum / iface_pairs
         
         r_min_cb = 2.6
-        r_opt_cb = 3.6
-        r_cut_cb = 5.0
-        A_cb = 8.0
-        B_cb = 1.0
-        sigma_cb = 0.4
+        r_opt_cb = 3.8
+        r_cut_cb = 6.0
+        r_hard_cb = 2.2
+        A_soft_cb = 2.0
+        A_hard_cb = 10.0
+        B_cb = 3.0
+        sigma_cb = 0.6
         base_E_cb = torch.zeros_like(dist_cb)
-        mask_rep_cb = dist_cb < r_min_cb
-        base_E_cb[mask_rep_cb] = A_cb * (r_min_cb - dist_cb[mask_rep_cb]) ** 2
-        mask_well_cb = (dist_cb >= r_min_cb) & (dist_cb <= r_opt_cb)
-        base_E_cb[mask_well_cb] = -B_cb * torch.exp(-((dist_cb[mask_well_cb] - r_opt_cb) ** 2) / (sigma_cb ** 2))
+        mask_cut_cb = (dist_cb <= r_cut_cb) & (dist_cb > 0.0)
+        mask_hard_cb = (dist_cb < r_hard_cb) & mask_cut_cb
+        mask_soft_cb = (dist_cb >= r_hard_cb) & (dist_cb < r_min_cb) & mask_cut_cb
+        mask_well_cb = (dist_cb >= r_min_cb) & (dist_cb <= r_opt_cb) & mask_cut_cb
+        if mask_soft_cb.any():
+            base_E_cb[mask_soft_cb] = A_soft_cb * (r_min_cb - dist_cb[mask_soft_cb]) ** 2
+        if mask_hard_cb.any():
+            base_E_cb[mask_hard_cb] = A_hard_cb * (r_hard_cb - dist_cb[mask_hard_cb]) ** 2 + A_soft_cb * (r_min_cb - r_hard_cb) ** 2
+        if mask_well_cb.any():
+            base_E_cb[mask_well_cb] = -B_cb * torch.exp(-((dist_cb[mask_well_cb] - r_opt_cb) ** 2) / (sigma_cb ** 2))
         type_idx = torch.zeros_like(aa_indices)
         hph_set = set(['A','V','I','L','M','F','W','Y'])
         pos_set = set(['K','R','H'])
@@ -1168,7 +1176,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
                              [0.2,0.8,1.2,0.3]], device=device, dtype=dist_cb.dtype)
         wtype_cb = W_tb[ti, tj]
         E_cb = base_E_cb * wtype_cb
-        mask_cut_cb = (dist_cb <= r_cut_cb) & (dist_cb > 0.0)
         if mask_cut_cb.any():
             loss_mj = torch.sum(E_cb * mask_nonlocal * mask_cut_cb * ((1.0 - cross_mask) + cross_mask * ori_gate)) / (torch.sum(mask_nonlocal * mask_cut_cb) + 1.0)
         else:
@@ -1232,6 +1239,21 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             loss_hydro_centroid = torch.mean(dist_h)
         else:
             loss_hydro_centroid = torch.tensor(0.0, device=device)
+        
+        hydro_mask_cd = full_hydro > 0.0
+        if hydro_mask_cd.any():
+            hp_vec = hydro_mask_cd.float()
+            pair_hp = hp_vec.unsqueeze(0) * hp_vec.unsqueeze(1)
+            r0_cd = 4.0
+            rho_mat = torch.exp(-((dist_cb / r0_cd) ** 2)) * pair_hp
+            eye_cd = torch.eye(total_residues, device=device, dtype=dist_cb.dtype)
+            rho_mat = rho_mat * (1.0 - eye_cd)
+            rho = torch.sum(rho_mat, dim=1)
+            rho_h = rho[hydro_mask_cd]
+            rho_excess = torch.relu(rho_h - 4.5)
+            loss_contact_density = torch.mean(rho_excess ** 2)
+        else:
+            loss_contact_density = torch.tensor(0.0, device=device)
         
         full_H = torch.cat(all_H)
         diff_ho = full_H.unsqueeze(1) - full_O.unsqueeze(0)
@@ -1322,8 +1344,8 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         w_rama = 4.0 # Boosted: Biological backbone preference is strong
         w_omega = 3.0
         w_hb = 4.0
-        w_hydro = 3.0 # Slightly reduced, rely more on burial/MJ
-        w_iface_hydro = 2.5
+        w_hydro = 2.0
+        w_iface_hydro = 2.0
         w_elec = 1.5
         w_catpi = 1.0
         w_pipi = 1.0
@@ -1332,20 +1354,20 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
         w_burial = 4.0
         w_polar = 2.0
         w_smooth = 0.0 # User Feedback: "Invisible wire" effect. Disable smooth path.
-        w_mj = 4.0 # Boosted: Statistical potential reflects natural selection
+        w_mj = 2.0
         w_disulfide = 5.0 # Strong bias for SS bonds
-        w_ca_hard36 = 10.0
+        w_ca_hard36 = 7.0
         w_ca_lj = 1.0
         w_elec_bb = 0.8
         
-        w_hydro_collapse = 3.0
-        w_hydro_centroid = 0.5
-        w_charged_clash = 50.0
+        w_hydro_collapse = 2.0
+        w_hydro_centroid = 1.0
+        w_charged_clash = 35.0
         w_frag = 1.0
         w_beta = 3.0
         w_loop = 1.0
-        w_contact_density = 0.3
-        w_charge_burial = 5.0
+        w_contact_density = 0.4
+        w_charge_burial = 3.5
         if opt_phase == "warmup":
             w_ss = 0.5
             w_rama = 1.5
@@ -1357,9 +1379,6 @@ def optimize_from_ss_gpu(sequence, chain_ss_list, output_pdb, constraints=None, 
             w_burial = 3.0
             w_polar = 0.5
             w_frag = 0.5
-        
-        mean_nc = torch.mean(neighbor_counts)
-        loss_contact_density = (mean_nc - 8.0) ** 2
         
         loss = (loss_ss * w_ss + loss_rama * w_rama + loss_omega * w_omega + loss_smooth * w_smooth + loss_rg_target * w_rg_tgt + 
                 clash_loss * w_clash + loss_hard_clash * w_hard_clash + heavy_loss * w_heavy + loss_ca_continuity * w_ca_cont +

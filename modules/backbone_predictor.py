@@ -623,7 +623,7 @@ def optimize_from_ss(sequence, chain_ss_list, output_pdb, iters=2):
         try:
             res = minimize(_objective_joint, x0, args=(chain_data, total_residues),
                           method="L-BFGS-B",
-                          options={'maxiter': 300, 'ftol': 1e-4, 'disp': False},
+                          options={'maxiter': 1024, 'ftol': 1e-4, 'disp': False},
                           bounds=bounds)
             
             if res.fun < best_val:

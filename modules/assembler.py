@@ -169,7 +169,7 @@ def assemble_chains(chains, verbose=False):
     if verbose: print("Optimizing complex assembly...")
     
     try:
-        res = minimize(objective, x0, method='L-BFGS-B', options={'maxiter': 100, 'disp': verbose})
+        res = minimize(objective, x0, method='L-BFGS-B', options={'maxiter': 1024, 'disp': verbose})
         final_chains = _get_transformed_chains(res.x)
     except Exception as e:
         print(f"Assembly optimization failed: {e}")

@@ -48,16 +48,26 @@ def contact_energy(CA, CB, seq, mj_matrix):
     diff = CB[np.newaxis, :, :] - CB[:, np.newaxis, :]
     dist = np.linalg.norm(diff, axis=2) + 1e-6
     r_min = 2.6
-    r_opt = 3.6
-    r_cut = 5.0
-    A = 8.0
-    B = 1.0
-    sigma = 0.4
+    r_opt = 3.8
+    r_cut = 6.0
+    r_hard = 2.2
+    A_soft = 2.0
+    A_hard = 10.0
+    B = 3.0
+    sigma = 0.6
     base_E = np.zeros_like(dist)
-    mask_rep = dist < r_min
-    base_E[mask_rep] = A * (r_min - dist[mask_rep]) ** 2
-    mask_well = (dist >= r_min) & (dist <= r_opt)
-    base_E[mask_well] = -B * np.exp(-((dist[mask_well] - r_opt) ** 2) / (sigma ** 2))
+    idx = np.arange(n)
+    pair_mask = (np.abs(idx[:, np.newaxis] - idx[np.newaxis, :]) > 2)
+    mask_cut = (dist <= r_cut) & pair_mask
+    mask_hard = (dist < r_hard) & mask_cut
+    mask_soft = (dist >= r_hard) & (dist < r_min) & mask_cut
+    mask_well = (dist >= r_min) & (dist <= r_opt) & mask_cut
+    if np.any(mask_soft):
+        base_E[mask_soft] = A_soft * (r_min - dist[mask_soft]) ** 2
+    if np.any(mask_hard):
+        base_E[mask_hard] = A_hard * (r_hard - dist[mask_hard]) ** 2 + A_soft * (r_min - r_hard) ** 2
+    if np.any(mask_well):
+        base_E[mask_well] = -B * np.exp(-((dist[mask_well] - r_opt) ** 2) / (sigma ** 2))
     atom_type = np.zeros((n,), dtype=int)
     seq_upper = [c.upper() for c in seq]
     for i in range(min(n, len(seq_upper))):
@@ -80,7 +90,6 @@ def contact_energy(CA, CB, seq, mj_matrix):
     tj = atom_type[np.newaxis, :]
     wtype = W[ti, tj]
     E = base_E * wtype
-    mask_cut = dist <= r_cut
     if not np.any(mask_cut):
         return 0.0
     score = np.sum(E[mask_cut])
